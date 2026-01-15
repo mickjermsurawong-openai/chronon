@@ -16,108 +16,136 @@
 
 package ai.chronon.spark
 
-import ai.chronon.aggregator.windowing.{
-  BatchIr,
-  FinalBatchIr,
-  FiveMinuteResolution,
-  Resolution,
-  SawtoothOnlineAggregator
-}
-import ai.chronon.aggregator.windowing.{FinalBatchIr, FiveMinuteResolution, Resolution, SawtoothOnlineAggregator}
+import ai.chronon.aggregator.windowing._
 import ai.chronon.api
-import ai.chronon.spark.catalog.TableUtils
-import ai.chronon.api.Accuracy
-import ai.chronon.api.Constants
-import ai.chronon.api.DataModel
-import ai.chronon.api.Extensions.GroupByOps
-import ai.chronon.api.Extensions.MetadataOps
-import ai.chronon.api.Extensions.SourceOps
-import ai.chronon.api.GroupByServingInfo
-import ai.chronon.api.PartitionSpec
-import ai.chronon.api.QueryUtils
+import ai.chronon.api.Extensions.{GroupByOps, MetadataOps, SourceOps}
 import ai.chronon.api.ScalaJavaConversions._
-import ai.chronon.api.ThriftJsonCodec
+import ai.chronon.api._
 import ai.chronon.online.Extensions.ChrononStructTypeOps
 import ai.chronon.online.GroupByServingInfoParsed
-import ai.chronon.api.PartitionRange
-import ai.chronon.online.serde.SparkConversions
 import ai.chronon.online.metrics.Metrics
+import ai.chronon.online.serde.{AvroConversions, SparkConversions}
 import ai.chronon.spark.Extensions._
-import ai.chronon.spark.submission.SparkSessionBuilder
-import org.apache.spark.SparkEnv
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.functions.lit
-import org.apache.spark.sql.functions.not
+import ai.chronon.spark.catalog.TableUtils
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.expressions.Aggregator
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types
-import org.apache.spark.sql.types.{StructField, StructType}
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
+import org.apache.spark.sql.types.{BinaryType, StringType, StructField, StructType}
+import org.apache.spark.sql.{DataFrame, Encoder, Encoders, Row, SparkSession}
+import org.slf4j.{Logger, LoggerFactory}
 
 import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 import scala.util.Try
 
-class GroupByUpload(endPartition: String, groupBy: GroupBy) extends Serializable {
+class TemporalEventsAggregator(
+    endTs: Long,
+    aggregations: Seq[api.Aggregation],
+    inputSchema: Seq[(String, api.DataType)],
+    resolution: Resolution
+) extends Aggregator[api.Row, BatchIr, FinalBatchIr]
+    with Serializable {
+
+  @transient private lazy val sawtoothAggregator = new SawtoothOnlineAggregator(
+    endTs,
+    aggregations,
+    inputSchema,
+    resolution
+  )
+
+  override def zero: BatchIr = sawtoothAggregator.init
+
+  override def reduce(buffer: BatchIr, input: api.Row): BatchIr = {
+    if (input == null) buffer
+    else sawtoothAggregator.update(buffer, input)
+  }
+
+  override def merge(b1: BatchIr, b2: BatchIr): BatchIr = {
+    sawtoothAggregator.merge(b1, b2)
+  }
+
+  override def finish(reduction: BatchIr): FinalBatchIr = {
+    sawtoothAggregator.normalizeBatchIr(reduction)
+  }
+
+  override def bufferEncoder: Encoder[BatchIr] = Encoders.kryo[BatchIr]
+  override def outputEncoder: Encoder[FinalBatchIr] = Encoders.kryo[FinalBatchIr]
+}
+
+class GroupByUpload(endPartition: String, groupBy: ai.chronon.spark.GroupBy) extends Serializable {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
   implicit val sparkSession: SparkSession = groupBy.sparkSession
   private val tableUtils: TableUtils = TableUtils(sparkSession)
   implicit private val partitionSpec: PartitionSpec = tableUtils.partitionSpec
 
-  private def snapshotAccuracyNullCountCheck(rdd: RDD[(Array[Any], Array[Any])],
-                                             fields: Array[StructField]): mutable.Map[String, Long] = {
-    rdd.cache()
+  private val avroSchema = StructType(
+    Seq(
+      StructField("key_bytes", BinaryType),
+      StructField("value_bytes", BinaryType),
+      StructField("key_json", StringType),
+      StructField("value_json", StringType)
+    ))
 
-    val nullCounts = rdd
-      .treeAggregate(mutable.HashMap.empty[String, Long])(
-        seqOp = { case (counterMap, (_, values)) =>
-          for (i <- values.indices) {
-            if (values(i) == null) {
-              val field = fields(i)
-              val key = field.name
-              counterMap.update(key, counterMap.getOrElse(key, 0L) + 1L)
-            }
-          }
-          counterMap
-        },
-        combOp = { (map1, map2) =>
-          map2.foreach { case (key, count) =>
-            map1.update(key, map1.getOrElse(key, 0L) + count)
-          }
-          map1
-        }
-      )
+  /** Convert a DataFrame with key/value columns to Avro format using Dataset.map */
+  private def toAvroDf(
+      df: DataFrame,
+      keyColumns: Seq[String],
+      valueColumns: Seq[String],
+      keySchema: StructType,
+      valueSchema: StructType,
+      jsonPercent: Int
+  ): DataFrame = {
+    val keyZSchema = keySchema.toChrononSchema("Key")
+    val valueZSchema = valueSchema.toChrononSchema("Value")
+    val keyToBytes = AvroConversions.encodeBytes(keyZSchema, GenericRowHandler.func)
+    val valueToBytes = AvroConversions.encodeBytes(valueZSchema, GenericRowHandler.func)
+    val keyToJson = AvroConversions.encodeJson(keyZSchema, GenericRowHandler.func)
+    val valueToJson = AvroConversions.encodeJson(valueZSchema, GenericRowHandler.func)
+    val jsonPercentDouble = jsonPercent.toDouble / 100
 
-    nullCounts
+    val keyIndices = keyColumns.map(df.schema.fieldIndex).toArray
+    val valueIndices = valueColumns.map(df.schema.fieldIndex).toArray
+
+    val rowEncoder: ExpressionEncoder[Row] = ExpressionEncoder(avroSchema)
+
+    logger.info(s"""
+          |key schema:
+          |  ${AvroConversions.fromChrononSchema(keyZSchema).toString(true)}
+          |value schema:
+          |  ${AvroConversions.fromChrononSchema(valueZSchema).toString(true)}
+          |""".stripMargin)
+
+    df.map { row =>
+      val keys = keyIndices.map(row.get)
+      val values = valueIndices.map(row.get)
+      val (keyJson, valueJson) = if (math.random() < jsonPercentDouble) {
+        (keyToJson(keys), valueToJson(values))
+      } else {
+        (null, null)
+      }
+      Row(keyToBytes(keys), valueToBytes(values), keyJson, valueJson)
+    }(rowEncoder)
+      .toDF()
   }
 
-  private def fromBase(rdd: RDD[(Array[Any], Array[Any])]): KvRdd = {
-
-    val nullCounts = snapshotAccuracyNullCountCheck(rdd, groupBy.postAggSchema.fields)
-
-    val pairRdd = rdd.map { case (keyAndDs, values) => keyAndDs.init -> values }
-
-    KvRdd(pairRdd, groupBy.keySchema, groupBy.postAggSchema, nullCounts.toMap)
+  /** Count nulls per value column on a DataFrame. Returns only columns that have at least one null. */
+  private def computeNullCounts(df: DataFrame, valueColumns: Seq[String]): Map[String, Long] = {
+    if (valueColumns.isEmpty) return Map.empty
+    val nullCountExprs = valueColumns.map(c =>
+      coalesce(sum(when(col(c).isNull, 1L).otherwise(0L)), lit(0L)).alias(c))
+    val row = df.agg(nullCountExprs.head, nullCountExprs.tail: _*).collect().head
+    valueColumns.zipWithIndex.flatMap { case (name, idx) =>
+      val count = row.getLong(idx)
+      if (count > 0) Some(name -> count) else None
+    }.toMap
   }
 
-  def snapshotEntities: KvRdd = {
+  def snapshotEntities(jsonPercent: Int = 1): (DataFrame, Map[String, Long]) = {
     if (groupBy.aggregations == null || groupBy.aggregations.isEmpty) {
-
-      val keySchema = groupBy.keySchema
-      val keyBuilder = FastHashing.generateKeyBuilder(keySchema.fieldNames, groupBy.inputDf.schema)
-
-      val valueSchema = groupBy.preAggSchema
-      val valuesIndices = valueSchema.fieldNames.map(groupBy.inputDf.schema.fieldIndex)
-
-      val rdd = groupBy.inputDf.rdd
-        .map { row =>
-          keyBuilder(row).data -> valuesIndices.map(row.get)
-        }
-
-      val nullCounts = snapshotAccuracyNullCountCheck(rdd, groupBy.preAggSchema.fields)
+      val valueColumns = groupBy.preAggSchema.fieldNames.toSeq
+      val nullCounts = computeNullCounts(groupBy.inputDf, valueColumns)
 
       logger.info(s"""
            |pre-agg upload:
@@ -126,118 +154,140 @@ class GroupByUpload(endPartition: String, groupBy: GroupBy) extends Serializable
            |  value schema: ${groupBy.preAggSchema.catalogString}
            |""".stripMargin)
 
-      KvRdd(rdd, groupBy.keySchema, groupBy.preAggSchema, nullCounts.toMap)
-
+      val kvDf = toAvroDf(
+        groupBy.inputDf,
+        groupBy.keySchema.fieldNames.toSeq,
+        valueColumns,
+        groupBy.keySchema,
+        groupBy.preAggSchema,
+        jsonPercent
+      )
+      (kvDf, nullCounts)
     } else {
-      fromBase(groupBy.snapshotEntitiesBase)
+      snapshotEntitiesWithAggregations(jsonPercent)
     }
   }
 
-  def snapshotEvents: KvRdd =
-    fromBase(groupBy.snapshotEventsBase(PartitionRange(endPartition, endPartition)))
+  private def snapshotEntitiesWithAggregations(jsonPercent: Int): (DataFrame, Map[String, Long]) = {
+    val aggregatedDf = groupBy.snapshotEntities
+    val valueColumns = groupBy.postAggSchema.fieldNames.toSeq
+    val nullCounts = computeNullCounts(aggregatedDf, valueColumns)
+    val kvDf = toAvroDf(
+      aggregatedDf,
+      groupBy.keyColumns,
+      valueColumns,
+      groupBy.keySchema,
+      groupBy.postAggSchema,
+      jsonPercent
+    )
+    (kvDf, nullCounts)
+  }
 
-  // Shared between events and mutations (temporal entities).
-  def temporalEvents(resolution: Resolution = FiveMinuteResolution): KvRdd = {
+  def snapshotEvents(jsonPercent: Int = 1): (DataFrame, Map[String, Long]) = {
+    val aggregatedDf = groupBy.snapshotEvents(PartitionRange(endPartition, endPartition))
+    val valueColumns = groupBy.postAggSchema.fieldNames.toSeq
+    val nullCounts = computeNullCounts(aggregatedDf, valueColumns)
+    val kvDf = toAvroDf(
+      aggregatedDf,
+      groupBy.keyColumns,
+      valueColumns,
+      groupBy.keySchema,
+      groupBy.postAggSchema,
+      jsonPercent
+    )
+    (kvDf, nullCounts)
+  }
+
+  def temporalEvents(jsonPercent: Int = 1, resolution: Resolution = FiveMinuteResolution): (DataFrame, Map[String, Long]) = {
     val endTs = tableUtils.partitionSpec.epochMillis(endPartition)
     logger.info(s"TemporalEvents upload end ts: $endTs")
 
-    val sawtoothOnlineAggregator = new SawtoothOnlineAggregator(
-      endTs,
-      groupBy.aggregations,
-      SparkConversions.toChrononSchema(groupBy.inputDf.schema),
-      resolution)
+    val inputSchema = groupBy.inputDf.schema
+    val chrononSchema = SparkConversions.toChrononSchema(inputSchema)
+    val aggregations = groupBy.aggregations
+    val tsIndex = groupBy.tsIndex
 
+    val sawtoothOnlineAggregator = new SawtoothOnlineAggregator(endTs, aggregations, chrononSchema, resolution)
     val irSchema = SparkConversions.fromChrononSchema(sawtoothOnlineAggregator.batchIrSchema)
-    val keyBuilder = FastHashing.generateKeyBuilder(groupBy.keyColumns.toArray, groupBy.inputDf.schema)
 
-    val batchIrElementSize = SparkEnv.get.serializer
-      .newInstance()
-      .serialize(sawtoothOnlineAggregator.init)
-      .capacity()
+    val temporalAggregator =
+      new TemporalEventsAggregator(endTs, aggregations, chrononSchema, resolution).toColumn.name("ir")
+
+    val keyBuilder = FastHashing.generateKeyBuilder(groupBy.keyColumns.toArray, inputSchema)
+
+    val tupleEncoder: Encoder[(KeyWithHash, api.Row)] = Encoders.kryo[(KeyWithHash, api.Row)]
+    val keyEncoder: Encoder[KeyWithHash] = Encoders.kryo[KeyWithHash]
+    val chrononRowEncoder: Encoder[api.Row] = Encoders.kryo[api.Row]
+    val outputEncoder: Encoder[(Array[Any], Array[Any])] = Encoders.kryo[(Array[Any], Array[Any])]
+
+    // Aggregate using Dataset API
+    val rawAggDs = groupBy.inputDf
+      .map { row =>
+        (keyBuilder(row), SparkConversions.toChrononRow(row, tsIndex): api.Row)
+      }(tupleEncoder)
+      .groupByKey(_._1)(keyEncoder)
+      .mapValues(_._2)(chrononRowEncoder)
+      .agg(temporalAggregator)
+
+    // Cache to avoid recomputing the aggregation for both null counts and Avro encoding
+    rawAggDs.cache()
+
+    // Compute null counts using the SawtoothOnlineAggregator
+    val nullCounts = rawAggDs.rdd.treeAggregate(mutable.HashMap.empty[String, Long])(
+      seqOp = { case (counterMap, (_, batchIr)) =>
+        sawtoothOnlineAggregator.updateNullCounts(batchIr, counterMap)
+        counterMap
+      },
+      combOp = { (map1, map2) =>
+        map2.foreach { case (key, count) =>
+          map1.update(key, map1.getOrElse(key, 0L) + count)
+        }
+        map1
+      }
+    ).toMap
+
+    val aggregatedDs = rawAggDs.map { case (keyWithHash: KeyWithHash, finalIr: FinalBatchIr) =>
+      (keyWithHash.data, Array[Any](finalIr.collapsed, finalIr.tailHops))
+    }(outputEncoder)
+
+    // Convert to Avro DataFrame
+    val keyZSchema = groupBy.keySchema.toChrononSchema("Key")
+    val valueZSchema = irSchema.toChrononSchema("Value")
+    val keyToBytes = AvroConversions.encodeBytes(keyZSchema, GenericRowHandler.func)
+    val valueToBytes = AvroConversions.encodeBytes(valueZSchema, GenericRowHandler.func)
+    val keyToJson = AvroConversions.encodeJson(keyZSchema, GenericRowHandler.func)
+    val valueToJson = AvroConversions.encodeJson(valueZSchema, GenericRowHandler.func)
+    val jsonPercentDouble = jsonPercent.toDouble / 100
+
+    implicit val rowEncoder: ExpressionEncoder[Row] = ExpressionEncoder(avroSchema)
 
     logger.info(s"""
-        |BatchIR Element Size: $batchIrElementSize
-        |""".stripMargin)
+          |key schema:
+          |  ${AvroConversions.fromChrononSchema(keyZSchema).toString(true)}
+          |value schema:
+          |  ${AvroConversions.fromChrononSchema(valueZSchema).toString(true)}
+          |""".stripMargin)
 
-    val shouldCombine = tableUtils.sparkSession.conf.get("spark.chronon.group_by.upload.combine", "true").toBoolean
-
-    val outputRddKeyed = groupBy.inputDf.rdd
-      .keyBy(keyBuilder)
-
-    val outputRddAggregated = if (!shouldCombine) {
-      outputRddKeyed
-        .mapValues { row =>
-          val result: Either[Row, BatchIr] = Left(row)
-          result
+    val avroDf = aggregatedDs
+      .map { case (keys: Array[Any], values: Array[Any]) =>
+        val (keyJson, valueJson) = if (math.random() < jsonPercentDouble) {
+          (keyToJson(keys), valueToJson(values))
+        } else {
+          (null, null)
         }
-        .reduceByKey { (value1: Either[Row, BatchIr], value2: Either[Row, BatchIr]) =>
-          val resultIr: BatchIr = (value1, value2) match {
-            case (Left(row1), Left(row2)) =>
-              val batchIr = sawtoothOnlineAggregator.init
-              val batchIr1 =
-                sawtoothOnlineAggregator.update(batchIr, SparkConversions.toChrononRow(row1, groupBy.tsIndex))
-              sawtoothOnlineAggregator.update(batchIr1, SparkConversions.toChrononRow(row2, groupBy.tsIndex))
-            case (Right(ir1), Left(row2)) =>
-              sawtoothOnlineAggregator.update(ir1, SparkConversions.toChrononRow(row2, groupBy.tsIndex))
-            case (Left(row1), Right(ir2)) =>
-              sawtoothOnlineAggregator.update(ir2, SparkConversions.toChrononRow(row1, groupBy.tsIndex))
-            case (Right(ir1), Right(ir2)) =>
-              sawtoothOnlineAggregator.merge(ir1, ir2)
-          }
-          Right(resultIr)
-        }
-        .mapValues { resultIr: Either[Row, BatchIr] =>
-          resultIr match {
-            case Left(row1) =>
-              val batchIr = sawtoothOnlineAggregator.init
-              sawtoothOnlineAggregator.update(batchIr, SparkConversions.toChrononRow(row1, groupBy.tsIndex))
-            case Right(batchIr) => batchIr
-          }
-        }
-    } else {
-      outputRddKeyed.aggregateByKey(sawtoothOnlineAggregator.init)( // shuffle point
-        seqOp = { case (batchIr, row) =>
-          sawtoothOnlineAggregator.update(batchIr, SparkConversions.toChrononRow(row, groupBy.tsIndex))
-        },
-        combOp = sawtoothOnlineAggregator.merge
-      )
-    }
+        Row(keyToBytes(keys), valueToBytes(values), keyJson, valueJson)
+      }(rowEncoder)
+      .toDF()
 
-    val outputAggregatedNormalized = outputRddAggregated
-      .mapValues(sawtoothOnlineAggregator.normalizeBatchIr)
-
-    // Going to produce nullCounts and also later .save
-    outputAggregatedNormalized.cache()
-
-    val nullCounts = outputAggregatedNormalized
-      .treeAggregate(mutable.HashMap.empty[String, Long])(
-        seqOp = { case (counterMap, (_, batchIr)) =>
-          sawtoothOnlineAggregator.updateNullCounts(batchIr, counterMap)
-          counterMap
-        },
-        combOp = { (map1, map2) =>
-          map2.foreach { case (key, count) =>
-            map1.update(key, map1.getOrElse(key, 0L) + count)
-          }
-          map1
-        }
-      )
-
-    val outputRdd = outputAggregatedNormalized
-      .map { case (keyWithHash: KeyWithHash, finalBatchIr: FinalBatchIr) =>
-        val irArray = new Array[Any](2)
-        irArray.update(0, finalBatchIr.collapsed)
-        irArray.update(1, finalBatchIr.tailHops)
-        keyWithHash.data -> irArray
-      }
-
-    KvRdd(outputRdd, groupBy.keySchema, irSchema, nullCounts.toMap)
+    (avroDf, nullCounts)
   }
 
 }
 
 object GroupByUpload {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+
+  case class UploadResult(kvDf: DataFrame, nullCounts: Map[String, Long])
 
   // TODO - remove this if spark streaming can't reach hive tables
   private def buildServingInfo(groupByConf: api.GroupBy,
@@ -309,28 +359,33 @@ object GroupByUpload {
     result
   }
 
-  private[spark] def generateKvRdd(groupByConf: api.GroupBy,
-                                   endDs: String,
-                                   showDf: Boolean = false,
-                                   tableUtils: TableUtils,
-                                   maybeContext: Option[Metrics.Context] = None) = {
+  private[spark] def generateKvDf(groupByConf: api.GroupBy,
+                                  endDs: String,
+                                  showDf: Boolean = false,
+                                  tableUtils: TableUtils,
+                                  jsonPercent: Int = 1,
+                                  maybeContext: Option[Metrics.Context] = None): UploadResult = {
     implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
     Option(groupByConf.setups).foreach(_.foreach(tableUtils.sql))
     // add 1 day to the batch end time to reflect data [ds 00:00:00.000, ds + 1 00:00:00.000)
     val batchEndDate = partitionSpec.after(endDs)
     // for snapshot accuracy - we don't need to scan mutations
     lazy val groupBy =
-      GroupBy.from(groupByConf, PartitionRange(endDs, endDs), tableUtils, computeDependency = true, showDf = showDf)
+      ai.chronon.spark.GroupBy.from(groupByConf,
+                                    PartitionRange(endDs, endDs),
+                                    tableUtils,
+                                    computeDependency = true,
+                                    showDf = showDf)
     lazy val groupByUpload = new GroupByUpload(endDs, groupBy)
     // for temporal accuracy - we don't need to scan mutations for upload
     // when endDs = xxxx-01-02 the timestamp from airflow is more than (xxxx-01-03 00:00:00)
     // we wait for event partitions of (xxxx-01-02) which contain data until (xxxx-01-02 23:59:59.999)
     lazy val shiftedGroupBy =
-      GroupBy.from(groupByConf,
-                   PartitionRange(endDs, endDs).shift(1),
-                   tableUtils,
-                   computeDependency = true,
-                   showDf = showDf)
+      ai.chronon.spark.GroupBy.from(groupByConf,
+                                    PartitionRange(endDs, endDs).shift(1),
+                                    tableUtils,
+                                    computeDependency = true,
+                                    showDf = showDf)
     lazy val shiftedGroupByUpload = new GroupByUpload(batchEndDate, shiftedGroupBy)
     // for mutations I need the snapshot from the previous day, but a batch end date of ds +1
     lazy val otherGroupByUpload = new GroupByUpload(batchEndDate, groupBy)
@@ -341,23 +396,23 @@ object GroupByUpload {
                    |Data Model: ${groupByConf.dataModel}
                    |""".stripMargin)
 
-    val result = (groupByConf.inferredAccuracy, groupByConf.dataModel) match {
-      case (Accuracy.SNAPSHOT, DataModel.EVENTS)   => groupByUpload.snapshotEvents
-      case (Accuracy.SNAPSHOT, DataModel.ENTITIES) => groupByUpload.snapshotEntities
-      case (Accuracy.TEMPORAL, DataModel.EVENTS)   => shiftedGroupByUpload.temporalEvents()
-      case (Accuracy.TEMPORAL, DataModel.ENTITIES) => otherGroupByUpload.temporalEvents()
+    val (kvDf, nullCounts) = (groupByConf.inferredAccuracy, groupByConf.dataModel) match {
+      case (Accuracy.SNAPSHOT, DataModel.EVENTS)   => groupByUpload.snapshotEvents(jsonPercent)
+      case (Accuracy.SNAPSHOT, DataModel.ENTITIES) => groupByUpload.snapshotEntities(jsonPercent)
+      case (Accuracy.TEMPORAL, DataModel.EVENTS)   => shiftedGroupByUpload.temporalEvents(jsonPercent)
+      case (Accuracy.TEMPORAL, DataModel.ENTITIES) => otherGroupByUpload.temporalEvents(jsonPercent)
     }
 
-    // Emit null count map metrics
+    // Emit null count metrics
     if (maybeContext.isDefined) {
-      logger.info(s"Emitting data quality metrics for ${result.nullCounts.keys.mkString("")} ")
-      result.nullCounts.foreach({ case (field, count) =>
+      logger.info(s"Emitting data quality metrics for ${nullCounts.keys.mkString(", ")} ")
+      nullCounts.foreach { case (field, count) =>
         maybeContext.get.gauge(s"NullCount.$field.$endDs", count)
-      })
+      }
       Thread.sleep(Constants.ScrapeWaitSeconds.seconds.toMillis)
     }
 
-    result
+    UploadResult(kvDf, nullCounts)
   }
 
   def run(groupByConf: api.GroupBy,
@@ -373,16 +428,16 @@ object GroupByUpload {
             .build(s"groupBy_${groupByConf.metaData.name}_upload")))
     val context = Metrics.Context(Metrics.Environment.GroupByUpload, groupByConf)
     val startTs = System.currentTimeMillis()
-    val kvRdd = generateKvRdd(groupByConf = groupByConf,
+    val result = generateKvDf(groupByConf = groupByConf,
                               endDs = endDs,
                               showDf = showDf,
                               tableUtils = tableUtils,
+                              jsonPercent = jsonPercent,
                               maybeContext = Option(context))
-
-    val kvDf = kvRdd.toAvroDf(jsonPercent = jsonPercent)
+    val kvDf = result.kvDf
 
     if (showDf) {
-      kvRdd.toFlatDf.prettyPrint()
+      kvDf.prettyPrint()
     }
 
     val groupByServingInfo = buildServingInfo(groupByConf, session = tableUtils.sparkSession, endDs).groupByServingInfo
@@ -394,16 +449,15 @@ object GroupByUpload {
         Constants.GroupByServingInfoKey,
         ThriftJsonCodec.toJsonStr(groupByServingInfo)
       ))
-    val metaRdd = tableUtils.sparkSession.sparkContext.parallelize(metaRows.toSeq)
-    val metaDf = tableUtils.sparkSession.createDataFrame(metaRdd, kvDf.schema)
+    val metaDf = tableUtils.sparkSession.createDataFrame(
+      java.util.Arrays.asList(metaRows: _*),
+      kvDf.schema
+    )
 
     kvDf
       .union(metaDf)
       .withColumn("ds", lit(endDs))
       .save(groupByConf.metaData.uploadTable, groupByConf.metaData.tableProps, partitionColumns = List("ds"))
-
-    // unpersist RDD
-    kvRdd.data.unpersist()
 
     val kvDfReloaded = tableUtils
       .loadTable(groupByConf.metaData.uploadTable)
