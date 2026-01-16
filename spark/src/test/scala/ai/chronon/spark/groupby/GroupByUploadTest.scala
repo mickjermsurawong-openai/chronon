@@ -172,7 +172,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         metaData = Builders.MetaData(namespace = namespace, name = "test_multiple_avg_upload"),
         accuracy = Accuracy.TEMPORAL
       )
-    val result = GroupByUpload.generateKvDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
 
     result.keys.size shouldBe 3 // 3 output columns. 1 agg with 1 window, 1 agg with 2 windows = 3 output columns
     result.values.foreach { count =>
@@ -208,7 +208,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         metaData = Builders.MetaData(namespace = namespace, name = "test_multiple_avg_upload"),
         accuracy = Accuracy.TEMPORAL
       )
-    val result = GroupByUpload.generateKvDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
 
     result.isEmpty shouldBe true // empty null count map
   }
@@ -240,7 +240,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         metaData = Builders.MetaData(namespace = namespace, name = "test_multiple_avg_upload"),
         accuracy = Accuracy.SNAPSHOT
       )
-    val result = GroupByUpload.generateKvDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(groupByConf, endDs = yesterday, tableUtils = tableUtils).nullCounts
 
     result shouldBe empty
   }
@@ -274,7 +274,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
         metaData = Builders.MetaData(namespace = namespace, name = "test_multiple_avg_upload"),
         accuracy = Accuracy.SNAPSHOT
       )
-    val result = GroupByUpload.generateKvDf(groupByConf, endDs = batchEndDs, tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(groupByConf, endDs = batchEndDs, tableUtils = tableUtils).nullCounts
 
     result.isEmpty shouldBe false
     result.keys.size shouldBe 2 // only the list_event unbounded was non-null. the other two should be null
@@ -294,7 +294,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     reviewGroupBy.aggregations = null
     reviewGroupBy.accuracy = Accuracy.SNAPSHOT
 
-    val result = GroupByUpload.generateKvDf(reviewGroupBy, endDs = "2023-08-15", tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(reviewGroupBy, endDs = "2023-08-15", tableUtils = tableUtils).nullCounts
     result shouldBe empty
   }
 
@@ -314,7 +314,7 @@ class GroupByUploadTest extends SparkTestBase with Matchers {
     reviewGroupBy.aggregations = null
     reviewGroupBy.accuracy = Accuracy.SNAPSHOT
 
-    val result = GroupByUpload.generateKvDf(reviewGroupBy, endDs = "2023-08-15", tableUtils = tableUtils).nullCounts
+    val result = GroupByUpload.generateDf(reviewGroupBy, endDs = "2023-08-15", tableUtils = tableUtils).nullCounts
     result.isEmpty shouldBe false
     result.values .foreach { count =>
       count shouldBe 1L
@@ -656,7 +656,7 @@ object GroupByUploadTest {
         metaData = Builders.MetaData(namespace = namespace, name = "test_multiple_avg_upload"),
         accuracy = Accuracy.TEMPORAL
       )
-    val uploadResult = GroupByUpload.generateKvDf(groupByConf, endDs = "2023-08-14", tableUtils = tableUtils)
+    val uploadResult = GroupByUpload.generateDf(groupByConf, endDs = "2023-08-14", tableUtils = tableUtils)
     val result = uploadResult.kvDf
 
     // Check the DataFrame structure and row count

@@ -359,12 +359,12 @@ object GroupByUpload {
     result
   }
 
-  private[spark] def generateKvDf(groupByConf: api.GroupBy,
-                                  endDs: String,
-                                  showDf: Boolean = false,
-                                  tableUtils: TableUtils,
-                                  jsonPercent: Int = 1,
-                                  maybeContext: Option[Metrics.Context] = None): UploadResult = {
+  private[spark] def generateDf(groupByConf: api.GroupBy,
+                                endDs: String,
+                                showDf: Boolean = false,
+                                tableUtils: TableUtils,
+                                jsonPercent: Int = 1,
+                                maybeContext: Option[Metrics.Context] = None): UploadResult = {
     implicit val partitionSpec: PartitionSpec = tableUtils.partitionSpec
     Option(groupByConf.setups).foreach(_.foreach(tableUtils.sql))
     // add 1 day to the batch end time to reflect data [ds 00:00:00.000, ds + 1 00:00:00.000)
@@ -428,12 +428,12 @@ object GroupByUpload {
             .build(s"groupBy_${groupByConf.metaData.name}_upload")))
     val context = Metrics.Context(Metrics.Environment.GroupByUpload, groupByConf)
     val startTs = System.currentTimeMillis()
-    val result = generateKvDf(groupByConf = groupByConf,
-                              endDs = endDs,
-                              showDf = showDf,
-                              tableUtils = tableUtils,
-                              jsonPercent = jsonPercent,
-                              maybeContext = Option(context))
+    val result = generateDf(groupByConf = groupByConf,
+                            endDs = endDs,
+                            showDf = showDf,
+                            tableUtils = tableUtils,
+                            jsonPercent = jsonPercent,
+                            maybeContext = Option(context))
     val kvDf = result.kvDf
 
     if (showDf) {
