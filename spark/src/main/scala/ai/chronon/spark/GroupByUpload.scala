@@ -133,8 +133,7 @@ class GroupByUpload(endPartition: String, groupBy: ai.chronon.spark.GroupBy) ext
   /** Count nulls per value column on a DataFrame. Returns only columns that have at least one null. */
   private def computeNullCounts(df: DataFrame, valueColumns: Seq[String]): Map[String, Long] = {
     if (valueColumns.isEmpty) return Map.empty
-    val nullCountExprs = valueColumns.map(c =>
-      coalesce(sum(when(col(c).isNull, 1L).otherwise(0L)), lit(0L)).alias(c))
+    val nullCountExprs = valueColumns.map(c => coalesce(sum(when(col(c).isNull, 1L).otherwise(0L)), lit(0L)).alias(c))
     val row = df.agg(nullCountExprs.head, nullCountExprs.tail: _*).collect().head
     valueColumns.zipWithIndex.flatMap { case (name, idx) =>
       val count = row.getLong(idx)
@@ -198,7 +197,8 @@ class GroupByUpload(endPartition: String, groupBy: ai.chronon.spark.GroupBy) ext
     (kvDf, nullCounts)
   }
 
-  def temporalEvents(jsonPercent: Int = 1, resolution: Resolution = FiveMinuteResolution): (DataFrame, Map[String, Long]) = {
+  def temporalEvents(jsonPercent: Int = 1,
+                     resolution: Resolution = FiveMinuteResolution): (DataFrame, Map[String, Long]) = {
     val endTs = tableUtils.partitionSpec.epochMillis(endPartition)
     logger.info(s"TemporalEvents upload end ts: $endTs")
 
@@ -233,18 +233,20 @@ class GroupByUpload(endPartition: String, groupBy: ai.chronon.spark.GroupBy) ext
     rawAggDs.cache()
 
     // Compute null counts using the SawtoothOnlineAggregator
-    val nullCounts = rawAggDs.rdd.treeAggregate(mutable.HashMap.empty[String, Long])(
-      seqOp = { case (counterMap, (_, batchIr)) =>
-        sawtoothOnlineAggregator.updateNullCounts(batchIr, counterMap)
-        counterMap
-      },
-      combOp = { (map1, map2) =>
-        map2.foreach { case (key, count) =>
-          map1.update(key, map1.getOrElse(key, 0L) + count)
+    val nullCounts = rawAggDs.rdd
+      .treeAggregate(mutable.HashMap.empty[String, Long])(
+        seqOp = { case (counterMap, (_, batchIr)) =>
+          sawtoothOnlineAggregator.updateNullCounts(batchIr, counterMap)
+          counterMap
+        },
+        combOp = { (map1, map2) =>
+          map2.foreach { case (key, count) =>
+            map1.update(key, map1.getOrElse(key, 0L) + count)
+          }
+          map1
         }
-        map1
-      }
-    ).toMap
+      )
+      .toMap
 
     val aggregatedDs = rawAggDs.map { case (keyWithHash: KeyWithHash, finalIr: FinalBatchIr) =>
       (keyWithHash.data, Array[Any](finalIr.collapsed, finalIr.tailHops))
