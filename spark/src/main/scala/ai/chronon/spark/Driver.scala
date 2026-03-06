@@ -34,6 +34,7 @@ import ai.chronon.spark.streaming.JoinSourceRunner
 import org.apache.commons.io.FileUtils
 import org.apache.spark.SparkFiles
 import org.apache.spark.sql.{DataFrame, SparkSession, SparkSessionExtensions}
+import org.apache.spark.sql.functions
 import org.apache.spark.sql.streaming.StreamingQueryListener
 import org.apache.spark.sql.streaming.StreamingQueryListener.{
   QueryProgressEvent,
@@ -1009,6 +1010,130 @@ object Driver {
     }
   }
 
+  object CompareTablesGeneric {
+    @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
+
+    class Args extends Subcommand("compare-tables") with OfflineSubcommand {
+      val leftTable: ScallopOption[String] =
+        opt[String](required = true, descr = "Fully qualified left table name")
+      val rightTable: ScallopOption[String] =
+        opt[String](required = true, descr = "Fully qualified right table name")
+      val keys: ScallopOption[List[String]] =
+        opt[List[String]](required = true, descr = "Comma-separated key columns (using left table names)")
+      val mapping: ScallopOption[String] =
+        opt[String](required = false,
+                    descr = "JSON map of left_col_name -> SQL expr on right table for renames/transforms")
+      val timestampMillisLeft: ScallopOption[String] =
+        opt[String](required = false, descr = "SQL expression on left table to produce ts (Long millis)")
+      val timestampMillisRight: ScallopOption[String] =
+        opt[String](required = false, descr = "SQL expression on right table to produce ts (Long millis)")
+      val sideBySideTable: ScallopOption[String] =
+        opt[String](required = true, descr = "Output table for joined comparison DataFrame")
+      val metricsTable: ScallopOption[String] =
+        opt[String](required = true, descr = "Output table for computed metrics")
+      val leftColumns: ScallopOption[List[String]] =
+        opt[List[String]](required = false,
+                          descr = "Subset of left table columns to compare. If omitted, all non-key columns.")
+      val migrationCheck: ScallopOption[Boolean] =
+        opt[Boolean](required = false, default = Some(false), descr = "Allow left side to have extra columns")
+
+      override def subcommandName(): String = "compare_tables"
+    }
+
+    def run(args: Args): Unit = {
+      val sparkSession = args.sparkSession
+      val tableUtils = TableUtils(sparkSession)
+      import ai.chronon.spark.Extensions._
+
+      val rawLeftDf = sparkSession.table(args.leftTable())
+      val rawRightDf = sparkSession.table(args.rightTable())
+      val keyColumns = args.keys()
+
+      // Parse mapping JSON: left_col_name -> SQL expr on right table
+      val mappingJson: Map[String, String] = args.mapping.toOption
+        .map { json =>
+          import scala.collection.JavaConverters._
+          val mapper = new com.fasterxml.jackson.databind.ObjectMapper()
+          mapper
+            .readValue(json, classOf[java.util.Map[String, String]])
+            .asScala
+            .toMap
+        }
+        .getOrElse(Map.empty)
+
+      // Determine which key columns have renames via mapping
+      val keyRenames: Map[String, String] = mappingJson.filter { case (leftCol, _) => keyColumns.contains(leftCol) }
+      val valueMapping: Map[String, String] = mappingJson.filterNot { case (leftCol, _) =>
+        keyColumns.contains(leftCol)
+      }
+
+      // Select left columns: if --left-columns specified, use those + keys; otherwise all columns
+      val leftDf = args.leftColumns.toOption match {
+        case Some(cols) =>
+          val allLeftCols = (keyColumns ++ cols).distinct
+          rawLeftDf.select(allLeftCols.map(functions.col): _*)
+        case None => rawLeftDf
+      }
+
+      // Determine value columns on left side (non-key columns)
+      val leftValueColumns = leftDf.schema.fieldNames.filterNot(keyColumns.contains)
+
+      // Build right-side select expressions:
+      // - key columns: use rename from mapping or same name
+      // - value columns: use SQL expr from mapping or same name, aliased to left column name
+      val rightKeyExprs = keyColumns.map { k =>
+        keyRenames.get(k) match {
+          case Some(rightExpr) => s"$rightExpr AS $k"
+          case None            => k
+        }
+      }
+      val rightValueExprs = leftValueColumns.map { leftCol =>
+        valueMapping.get(leftCol) match {
+          case Some(rightExpr) => s"$rightExpr AS $leftCol"
+          case None            => leftCol
+        }
+      }
+      val rightDf = rawRightDf.selectExpr((rightKeyExprs ++ rightValueExprs): _*)
+
+      // Apply timestamp expressions if provided
+      val tsLeft = args.timestampMillisLeft.toOption
+      val tsRight = args.timestampMillisRight.toOption
+      val (finalLeftDf, finalRightDf, finalKeys) = (tsLeft, tsRight) match {
+        case (Some(leftExpr), Some(rightExpr)) =>
+          (leftDf.withColumn(Constants.TimeColumn, functions.expr(leftExpr)),
+           rightDf.withColumn(Constants.TimeColumn, functions.expr(rightExpr)),
+           keyColumns :+ Constants.TimeColumn)
+        case (None, None) =>
+          (leftDf, rightDf, keyColumns)
+        case _ =>
+          throw new IllegalArgumentException(
+            "Both --timestamp-millis-left and --timestamp-millis-right must be provided together, or neither")
+      }
+
+      val (compareDf, metricsFlatDf, metrics) = CompareBaseJob.compare(
+        finalLeftDf,
+        finalRightDf,
+        finalKeys,
+        tableUtils,
+        mapping = Map.empty, // mapping already applied via selectExpr above
+        migrationCheck = args.migrationCheck(),
+        name = s"${args.leftTable()}_vs_${args.rightTable()}",
+        requireTimeColumn = false
+      )
+
+      logger.info("Saving side-by-side comparison output..")
+      compareDf.save(args.sideBySideTable(), partitionColumns = List.empty)
+
+      logger.info("Saving metrics output..")
+      metricsFlatDf.save(args.metricsTable(), partitionColumns = List.empty)
+
+      logger.info("Printing basic comparison results..")
+      CompareJob.printAndGetBasicMetrics(metrics, tableUtils.partitionSpec)
+
+      logger.info("Finished compare-tables.")
+    }
+  }
+
   object CheckPartitions {
     private val helpNamingConvention =
       "Please follow the naming convention: --partition-names=schema.table/pk1=pv1/pk2=pv2"
@@ -1174,6 +1299,8 @@ object Driver {
     addSubcommand(MergeJobRunArgs)
     object CheckPartitionArgs extends CheckPartitions.Args
     addSubcommand(CheckPartitionArgs)
+    object CompareTablesGenericArgs extends CompareTablesGeneric.Args
+    addSubcommand(CompareTablesGenericArgs)
     requireSubcommand()
     verify()
   }
@@ -1218,8 +1345,9 @@ object Driver {
           case args.SourceJobRunArgs       => SourceJobRun.run(args.SourceJobRunArgs)
           case args.JoinPartJobRunArgs     => JoinPartJobRun.run(args.JoinPartJobRunArgs)
           case args.MergeJobRunArgs        => MergeJobRun.run(args.MergeJobRunArgs)
-          case args.CheckPartitionArgs     => CheckPartitions.run(args.CheckPartitionArgs)
-          case _                           => logger.info(s"Unknown subcommand: $x")
+          case args.CheckPartitionArgs        => CheckPartitions.run(args.CheckPartitionArgs)
+          case args.CompareTablesGenericArgs => CompareTablesGeneric.run(args.CompareTablesGenericArgs)
+          case _                            => logger.info(s"Unknown subcommand: $x")
         }
       case None => logger.info("specify a subcommand please")
     }
