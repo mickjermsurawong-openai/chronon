@@ -262,8 +262,9 @@ class JavaStatsService(api: Api,
     * @param tableName The table name
     * @param endTimeMillis Optional end time to get the latest cardinalityMap up to this time
     */
-  private def fetchMetadata(tableName: String,
-                            endTimeMillis: Option[Long] = None): Option[(Map[String, Double], StructType, StructType)] = {
+  private def fetchMetadata(
+      tableName: String,
+      endTimeMillis: Option[Long] = None): Option[(Map[String, Double], StructType, StructType)] = {
     val cardinalityMapKey = s"$tableName/cardinalityMap"
     val selectedSchemaKey = s"$tableName/selectedSchema"
     val noKeysSchemaKey = s"$tableName/noKeysSchema"
