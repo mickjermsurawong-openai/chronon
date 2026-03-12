@@ -90,7 +90,11 @@ case class MonolithJoinPlanner(join: Join)(implicit outputPartitionSpec: Partiti
   }
 
   def statsComputeNode: Node = {
-    val stepDays = 1 // Stats computed daily
+    val defaultStepDays = 1
+    val effectiveStepDays = Option(join.metaData.executionInfo)
+      .filter(_.isSetStepDays)
+      .map(_.stepDays)
+      .getOrElse(defaultStepDays)
 
     // Stats compute depends on the monolith join output
     val tableDep = new TableDependency()
@@ -109,7 +113,7 @@ case class MonolithJoinPlanner(join: Join)(implicit outputPartitionSpec: Partiti
                           "stats_compute",
                           join.metaData.name + "__stats_compute",
                           Seq(tableDep),
-                          Some(stepDays))
+                          Some(effectiveStepDays))
 
     val node = new planner.JoinStatsComputeNode().setJoin(join)
     toNode(metaData, _.setJoinStatsCompute(node), semanticMonolithJoin(join))

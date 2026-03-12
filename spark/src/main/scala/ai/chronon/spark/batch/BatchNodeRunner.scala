@@ -274,13 +274,8 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     val joinConf = joinStatsCompute.join
     val joinName = metadata.name
 
-    // TODO: Support step-days > 1 for stats computation
-    //   Currently processes the entire date range [range.start, range.end] in one batch.
-    //   For large date ranges or resource-constrained environments, allow processing in steps:
-    //     - Add stepDays parameter (default = entire range)
-    //     - Iterate through range in stepDays chunks (e.g., 3 days at a time)
-    //     - Write each chunk to output table incrementally
-    //   Benefits: Better memory management, checkpointing for long-running jobs, partial progress on failures
+    // step-days slicing is handled by the orchestrator via DependencyResolver.getMissingSteps;
+    // each invocation receives exactly one step-sized range.
     logger.info(s"Running stats compute for join '$joinName' for range: [${range.start}, ${range.end}]")
 
     // Import the necessary stats classes

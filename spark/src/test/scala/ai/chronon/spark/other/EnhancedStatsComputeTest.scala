@@ -79,14 +79,14 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq.empty, // No keys, we want stats on all columns
       name = "ratings_test",
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     // Check cardinality detection
     val cardinalityMap = enhancedStats.cardinalityMap
-    logger.info("Cardinality Map:")
+    logger.info("Cardinality Map (normalized distinct/total_rows):")
     cardinalityMap.foreach { case (col, card) =>
-      logger.info(s"  $col: $card (${if (card <= 100) "LOW" else "HIGH"} cardinality)")
+      logger.info(s"  $col: $card (${if (card <= 0.01) "LOW" else "HIGH"} cardinality)")
     }
 
     // Verify expected cardinalities
@@ -94,8 +94,8 @@ class EnhancedStatsComputeTest extends SparkTestBase {
     assert(cardinalityMap.contains("movieId"), "Should detect movieId cardinality")
     assert(cardinalityMap.contains("rating"), "Should detect rating cardinality")
 
-    // Rating should be low cardinality (0.5-5.0 scale)
-    assert(cardinalityMap("rating") <= 100, s"Rating should be low cardinality, got ${cardinalityMap("rating")}")
+    // Rating should be low cardinality (0.5-5.0 scale, ~10 distinct values out of ~100K rows → ratio << 0.01)
+    assert(cardinalityMap("rating") <= 0.01, s"Rating should be low cardinality, got ${cardinalityMap("rating")}")
   }
 
   it should "generate enhanced metrics based on cardinality" in {
@@ -105,7 +105,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq.empty,
       name = "ratings_enhanced_metrics",
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     // Check the enhanced metrics
@@ -139,7 +139,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq.empty,
       name = "ratings_daily_stats",
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     // Generate daily tiles (timeBucketMinutes = 0 means daily aggregation)
@@ -177,7 +177,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq.empty,
       name = "ratings_verification",
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     // Generate statistics (daily tiles)
@@ -214,16 +214,17 @@ class EnhancedStatsComputeTest extends SparkTestBase {
   it should "handle mixed cardinality columns appropriately" in {
     val df = ratingsData
 
-    // Test with different thresholds to see how it affects metric generation
-    val thresholds = Seq(10, 100, 1000)
+    // Test with different ratio thresholds to see how it affects metric generation.
+    // Thresholds are fractions of total rows: 0.001 = 0.1%, 0.01 = 1%, 0.1 = 10%.
+    val thresholds = Seq(0.001, 0.01, 0.1)
 
     thresholds.foreach { threshold =>
-      logger.info(s"\n=== Testing with cardinality threshold: $threshold ===")
+      logger.info(s"\n=== Testing with cardinality ratio threshold: $threshold ===")
 
       val enhancedStats = new EnhancedStatsCompute(
         inputDf = df,
         keys = Seq.empty,
-        name = s"ratings_threshold_$threshold",
+        name = s"ratings_threshold_${threshold.toString.replace(".", "_")}",
         cardinalityThreshold = threshold
       )
 
@@ -247,7 +248,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq.empty,
       name = "ratings_kv_upload",
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     // Generate daily tiles
@@ -313,7 +314,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = df,
       keys = Seq("userId"), // Exclude userId from stats (as it's a key)
       name = tableName,
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     logger.info(s"✓ Created EnhancedStatsCompute with ${enhancedStats.enhancedMetrics.length} metrics")
@@ -464,7 +465,7 @@ class EnhancedStatsComputeTest extends SparkTestBase {
       inputDf = evolvedDf,
       keys = Seq("userId"),
       name = tableName,  // Same table name - this is the evolution
-      cardinalityThreshold = 100
+      cardinalityThreshold = 0.01
     )
 
     logger.info(s"✓ Created EnhancedStatsCompute with evolved schema (${evolvedStats.enhancedMetrics.length} metrics)")

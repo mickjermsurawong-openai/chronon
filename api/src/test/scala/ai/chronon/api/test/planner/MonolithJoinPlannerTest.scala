@@ -173,6 +173,45 @@ class MonolithJoinPlannerTest extends AnyFlatSpec with Matchers {
     firstSemanticHashes should equal(secondSemanticHashes)
   }
 
+  it should "stats compute node should inherit stepDays from executionInfo" in {
+    val joinWithStepDays = Join(
+      metaData = MetaData(
+        name = "testStatsJoin",
+        executionInfo = new ExecutionInfo().setStepDays(7).setEnableStatsCompute(true)
+      ),
+      left = Builders.Source.events(Builders.Query(), table = "test_namespace.stats_step_days_table"),
+      joinParts = Seq.empty,
+      bootstrapParts = Seq.empty
+    )
+
+    val plan = MonolithJoinPlanner(joinWithStepDays).buildPlan
+
+    val statsNode = plan.nodes.asScala.find(_.content.isSetJoinStatsCompute)
+    statsNode should be(defined)
+    statsNode.get.metaData.executionInfo.stepDays should equal(7)
+
+    // Backfill terminal should be the stats node when stats are enabled
+    plan.terminalNodeNames.asScala(ai.chronon.planner.Mode.BACKFILL) should equal("testStatsJoin__stats_compute")
+  }
+
+  it should "stats compute node should default to stepDays=1 when executionInfo has no stepDays" in {
+    val joinNoStepDays = Join(
+      metaData = MetaData(
+        name = "testStatsJoinDefault",
+        executionInfo = new ExecutionInfo().setEnableStatsCompute(true)
+      ),
+      left = Builders.Source.events(Builders.Query(), table = "test_namespace.stats_default_step_days_table"),
+      joinParts = Seq.empty,
+      bootstrapParts = Seq.empty
+    )
+
+    val plan = MonolithJoinPlanner(joinNoStepDays).buildPlan
+
+    val statsNode = plan.nodes.asScala.find(_.content.isSetJoinStatsCompute)
+    statsNode should be(defined)
+    statsNode.get.metaData.executionInfo.stepDays should equal(1)
+  }
+
   it should "monolith join planner should produce exactly two nodes (backfill and metadata upload) for canary confs" in {
     val rootDir = Paths.get(getClass.getClassLoader.getResource("canary/compiled/joins").getPath)
 
