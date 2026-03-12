@@ -47,8 +47,8 @@ class AwsApiImpl(conf: Map[String, String]) extends Api(conf) {
       .map(Duration.parse)
       .getOrElse(DefaultApiTimeout)
 
-    val maybeRegion = sys.env.get("AWS_DEFAULT_REGION")
-    val maybeEndpoint = sys.env.get("DYNAMO_ENDPOINT")
+    val maybeRegion = getOptional("AWS_DEFAULT_REGION", conf)
+    val maybeEndpoint = getOptional("DYNAMO_ENDPOINT", conf)
 
     logger.info(
       s"Creating DynamoDB client. " +

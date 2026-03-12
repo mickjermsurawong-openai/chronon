@@ -158,9 +158,20 @@ object `package` extends PythonModule with RuffModule with PublishModule {
       }
     }
     
+    // Write the full pyproject.toml (with entry points) so pip sees the zipline CLI script
+    val pyprojectPath = pythonDir / "pyproject.toml"
+    val originalContent = os.read(pyprojectPath)
+    val fullContent = pyproject()
+    os.write.over(pyprojectPath, fullContent)
+
     // Install in editable mode
     println(s"Working directory: $pythonDir")
-    os.proc("python", "-m", "pip", "install", "-e", ".").call(cwd = pythonDir)
-    println("Package installed in editable mode with generated sources")
+    try {
+      os.proc("python", "-m", "pip", "install", "-e", ".").call(cwd = pythonDir)
+      println("Package installed in editable mode with generated sources")
+    } finally {
+      // Restore original pyproject.toml to avoid polluting the working tree
+      os.write.over(pyprojectPath, originalContent)
+    }
   }
 }

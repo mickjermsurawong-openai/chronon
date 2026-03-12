@@ -18,6 +18,7 @@ object KinesisConfig {
     val AwsAccessKeyId = "AWS_ACCESS_KEY_ID"
     val AwsSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
     val KinesisEndpoint = "KINESIS_ENDPOINT"
+    val AssumeRoleArn = "KINESIS_ASSUME_ROLE_ARN"
     val TaskParallelism = "tasks"
     val InitialPosition = "initial_position"
     val EnableEfo = "enable_efo"
@@ -35,24 +36,34 @@ object KinesisConfig {
     val region = lookup.requiredOneOf(Keys.AwsRegion, Keys.AwsDefaultRegion)
     val maybeAccessKeyId = lookup.optional(Keys.AwsAccessKeyId)
     val maybeSecretAccessKey = lookup.optional(Keys.AwsSecretAccessKey)
+    val maybeAssumeRoleArn = lookup.optional(Keys.AssumeRoleArn)
 
     properties.setProperty(AWSConfigConstants.AWS_REGION, region)
 
     // Credential provider selection:
+    // - ASSUME_ROLE: When a cross-account role ARN is provided. Uses the default credential chain
+    //                to assume the specified role (e.g., for reading Kinesis in another account)
     // - BASIC: When explicit credentials provided via -Z flags
     // - AUTO: When no -Z credentials provided.
     //         Uses AWS credential chain (env vars → system props → web identity → IAM roles)
-    (maybeAccessKeyId, maybeSecretAccessKey) match {
-      case (Some(accessKeyId), Some(secretAccessKey)) =>
-        properties.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "BASIC")
-        properties.setProperty(AWSConfigConstants.AWS_ACCESS_KEY_ID, accessKeyId)
-        properties.setProperty(AWSConfigConstants.AWS_SECRET_ACCESS_KEY, secretAccessKey)
-      case (None, None) =>
-        properties.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "AUTO")
-      case _ =>
-        throw new IllegalArgumentException(
-          s"Both ${Keys.AwsAccessKeyId} and ${Keys.AwsSecretAccessKey} must be provided together, or neither for IAM role-based auth"
-        )
+    maybeAssumeRoleArn match {
+      case Some(roleArn) =>
+        properties.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "ASSUME_ROLE")
+        properties.setProperty(AWSConfigConstants.AWS_ROLE_ARN, roleArn)
+        properties.setProperty(AWSConfigConstants.AWS_ROLE_SESSION_NAME, "chronon-kinesis-session")
+      case None =>
+        (maybeAccessKeyId, maybeSecretAccessKey) match {
+          case (Some(accessKeyId), Some(secretAccessKey)) =>
+            properties.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "BASIC")
+            properties.setProperty(AWSConfigConstants.AWS_ACCESS_KEY_ID, accessKeyId)
+            properties.setProperty(AWSConfigConstants.AWS_SECRET_ACCESS_KEY, secretAccessKey)
+          case (None, None) =>
+            properties.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "AUTO")
+          case _ =>
+            throw new IllegalArgumentException(
+              s"Both ${Keys.AwsAccessKeyId} and ${Keys.AwsSecretAccessKey} must be provided together, or neither for IAM role-based auth"
+            )
+        }
     }
 
     val initialPosition = lookup.optional(Keys.InitialPosition).getOrElse(Defaults.InitialPosition)

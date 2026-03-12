@@ -115,5 +115,36 @@ class KinesisConfigSpec extends AnyFlatSpec with Matchers {
     kinesisConfig.properties.getProperty(ConsumerConfigConstants.RECORD_PUBLISHER_TYPE) shouldBe ConsumerConfigConstants.RecordPublisherType.EFO.toString
     kinesisConfig.properties.getProperty(ConsumerConfigConstants.EFO_CONSUMER_NAME) shouldBe "consumer"
   }
+
+  it should "use ASSUME_ROLE credentials provider when role ARN is provided" in {
+    val props = Map(
+      Keys.AwsRegion -> "us-west-2",
+      Keys.AssumeRoleArn -> "arn:aws:iam::123456789012:role/CrossAccountKinesisRead"
+    )
+
+    val topicInfo = TopicInfo("test-stream", "kinesis", Map.empty)
+
+    val kinesisConfig = KinesisConfig.buildConsumerConfig(props, topicInfo)
+
+    kinesisConfig.properties.getProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER) shouldBe "ASSUME_ROLE"
+    kinesisConfig.properties.getProperty(AWSConfigConstants.AWS_ROLE_ARN) shouldBe "arn:aws:iam::123456789012:role/CrossAccountKinesisRead"
+    kinesisConfig.properties.getProperty(AWSConfigConstants.AWS_ROLE_SESSION_NAME) shouldBe "chronon-kinesis-session"
+  }
+
+  it should "prefer ASSUME_ROLE over BASIC credentials when both role ARN and access keys are provided" in {
+    val props = Map(
+      Keys.AwsRegion -> "us-west-2",
+      Keys.AssumeRoleArn -> "arn:aws:iam::123456789012:role/CrossAccountKinesisRead",
+      Keys.AwsAccessKeyId -> "access",
+      Keys.AwsSecretAccessKey -> "secret"
+    )
+
+    val topicInfo = TopicInfo("test-stream", "kinesis", Map.empty)
+
+    val kinesisConfig = KinesisConfig.buildConsumerConfig(props, topicInfo)
+
+    kinesisConfig.properties.getProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER) shouldBe "ASSUME_ROLE"
+    kinesisConfig.properties.getProperty(AWSConfigConstants.AWS_ROLE_ARN) shouldBe "arn:aws:iam::123456789012:role/CrossAccountKinesisRead"
+  }
 }
 

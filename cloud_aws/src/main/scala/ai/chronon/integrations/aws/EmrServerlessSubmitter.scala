@@ -23,7 +23,8 @@ class EmrServerlessSubmitter(
     flinkEksServiceAccount: Option[String] = None,
     flinkEksNamespace: Option[String] = None,
     eksClusterName: Option[String] = None,
-    ingressBaseUrl: Option[String] = None
+    ingressBaseUrl: Option[String] = None,
+    flinkHealthCheckFn: Option[String] => Boolean = _ => true
 ) extends JobSubmitter {
 
   private val DefaultEmrReleaseLabel = "emr-7.12.0"
@@ -244,9 +245,14 @@ class EmrServerlessSubmitter(
   override def status(jobId: String): JobStatusType = {
     if (jobId.startsWith("flink:")) {
       val parts = jobId.split(":", 3)
-      eksFlinkSubmitter
+      val eksStatus = eksFlinkSubmitter
         .getOrElse(throw new RuntimeException("EksFlinkSubmitter is required for Flink jobs"))
         .status(deploymentName = parts(2), namespace = parts(1))
+      eksStatus match {
+        case JobStatusType.RUNNING if flinkHealthCheckFn(getFlinkUrl(jobId)) => JobStatusType.RUNNING
+        case JobStatusType.RUNNING                                           => JobStatusType.PENDING
+        case other                                                           => other
+      }
     } else {
       try {
         val parts = jobId.split("\\|")
@@ -332,6 +338,17 @@ class EmrServerlessSubmitter(
           s"https://$awsRegion.console.aws.amazon.com/eks/clusters/$clusterName/deployments/$deploymentName?namespace=$namespace&region=$awsRegion"
         }
       } else None
+    } else if (jobId.contains("|")) {
+      val parts = jobId.split("\\|")
+      if (parts.length == 2) {
+        val appId = parts(0)
+        val jobRunId = parts(1)
+        val logGroup = java.net.URLEncoder.encode("/aws/emr-serverless", "UTF-8")
+        val logStream = java.net.URLEncoder.encode(s"applications/$appId/jobs/$jobRunId", "UTF-8")
+        Some(
+          s"https://$awsRegion.console.aws.amazon.com/cloudwatch/home?region=$awsRegion#logsV2:log-groups/log-group/$logGroup/log-events/$logStream"
+        )
+      } else None
     } else None
   }
 
@@ -414,8 +431,8 @@ class EmrServerlessSubmitter(
 
 object EmrServerlessSubmitter {
 
-  def apply(): EmrServerlessSubmitter = {
-    val region = sys.env.getOrElse("AWS_REGION", "us-east-1")
+  def apply(k8sConfig: Option[io.fabric8.kubernetes.client.Config] = None): EmrServerlessSubmitter = {
+    val region = sys.env.getOrElse("AWS_REGION", sys.env.getOrElse("AWS_DEFAULT_REGION", "us-east-1"))
     val applicationId = sys.env.get("EMR_SERVERLESS_APP_ID")
     val executionRoleArn = sys.env.getOrElse(
       "EMR_EXECUTION_ROLE_ARN",
@@ -425,13 +442,95 @@ object EmrServerlessSubmitter {
       "EMR_LOG_URI",
       throw new Exception("EMR_LOG_URI environment variable not set")
     )
+    val ingressBaseUrl = sys.env.get("HUB_BASE_URL")
 
     val client = EmrServerlessClient
       .builder()
       .region(Region.of(region))
       .build()
 
-    new EmrServerlessSubmitter(client, applicationId, executionRoleArn, s3LogUri)
+    new EmrServerlessSubmitter(
+      client,
+      applicationId,
+      executionRoleArn,
+      s3LogUri,
+      eksFlinkSubmitter = Some(new EksFlinkSubmitter(k8sConfig, ingressBaseUrl = ingressBaseUrl)),
+      awsRegion = region,
+      flinkEksServiceAccount = sys.env.get("FLINK_EKS_SERVICE_ACCOUNT"),
+      flinkEksNamespace = sys.env.get("FLINK_EKS_NAMESPACE"),
+      eksClusterName = sys.env.get("EKS_CLUSTER_NAME"),
+      ingressBaseUrl = ingressBaseUrl
+    )
+  }
+
+  private[aws] def createSubmissionPropsMap(jobType: JobType, args: Array[String]): Map[String, String] = {
+    val jarUri = JobSubmitter
+      .getArgValue(args, JarUriArgKeyword)
+      .getOrElse(throw new Exception("Missing required argument: " + JarUriArgKeyword))
+    val mainClass = JobSubmitter
+      .getArgValue(args, MainClassKeyword)
+      .getOrElse(throw new Exception("Missing required argument: " + MainClassKeyword))
+
+    jobType match {
+      case TypeSparkJob =>
+        val jobId = JobSubmitter
+          .getArgValue(args, JobIdArgKeyword)
+          .getOrElse(s"chronon-job-${System.currentTimeMillis()}")
+        Map(
+          MainClass -> mainClass,
+          JarURI -> jarUri,
+          JobId -> jobId
+        )
+      case TypeFlinkJob =>
+        val jobId = JobSubmitter
+          .getArgValue(args, JobIdArgKeyword)
+          .getOrElse(throw new Exception("Missing required argument: " + JobIdArgKeyword))
+        val flinkCheckpointUri = JobSubmitter
+          .getArgValue(args, StreamingCheckpointPathArgKeyword)
+          .getOrElse(throw new Exception(s"Missing required argument $StreamingCheckpointPathArgKeyword"))
+        val flinkMainJarUri = JobSubmitter
+          .getArgValue(args, FlinkMainJarUriArgKeyword)
+          .getOrElse(throw new Exception("Missing required argument: " + FlinkMainJarUriArgKeyword))
+        val eksServiceAccount = JobSubmitter
+          .getArgValue(args, EksServiceAccountArgKeyword)
+          .getOrElse(throw new Exception("Missing required argument: " + EksServiceAccountArgKeyword))
+        val eksNamespace = JobSubmitter
+          .getArgValue(args, EksNamespaceArgKeyword)
+          .getOrElse(throw new Exception("Missing required argument: " + EksNamespaceArgKeyword))
+        val maybeKinesisJarUri = JobSubmitter.getArgValue(args, FlinkKinesisJarUriArgKeyword)
+        val maybeFlinkJarsUri = JobSubmitter.getArgValue(args, FlinkJarsUriArgKeyword)
+        val maybeAdditionalJarsUri = JobSubmitter.getArgValue(args, AdditionalJarsUriArgKeyword)
+
+        val baseJobProps = Map(
+          JobId -> jobId,
+          MainClass -> mainClass,
+          JarURI -> jarUri,
+          FlinkMainJarURI -> flinkMainJarUri,
+          FlinkCheckpointUri -> flinkCheckpointUri,
+          EksServiceAccount -> eksServiceAccount,
+          EksNamespace -> eksNamespace
+        ) ++ maybeKinesisJarUri.map(FlinkKinesisConnectorJarURI -> _) ++
+          maybeFlinkJarsUri.map(FlinkJarsUri -> _) ++
+          maybeAdditionalJarsUri.map(AdditionalJars -> _)
+
+        val userPassedSavepoint = JobSubmitter.getArgValue(args, StreamingCustomSavepointArgKeyword)
+        val maybeSavepointUri =
+          if (userPassedSavepoint.isDefined) {
+            userPassedSavepoint
+          } else if (args.contains(StreamingLatestSavepointArgKeyword)) {
+            System.err.println("Latest savepoint not yet supported for EMR Serverless, proceeding without savepoint")
+            None
+          } else {
+            None
+          }
+
+        maybeSavepointUri match {
+          case Some(uri) =>
+            System.err.println(s"Deploying Flink app with savepoint uri $uri")
+            baseJobProps + (SavepointUri -> uri)
+          case None => baseJobProps
+        }
+    }
   }
 
   def main(args: Array[String]): Unit = {
@@ -439,19 +538,17 @@ object EmrServerlessSubmitter {
 
     val userArgs = args.filter(arg => !internalArgs.exists(arg.startsWith))
 
-    val jarUri = JobSubmitter
-      .getArgValue(args, JarUriArgKeyword)
-      .getOrElse(throw new Exception("Missing required argument: " + JarUriArgKeyword))
-    val mainClass = JobSubmitter
-      .getArgValue(args, MainClassKeyword)
-      .getOrElse(throw new Exception("Missing required argument: " + MainClassKeyword))
     val jobTypeValue = JobSubmitter
       .getArgValue(args, JobTypeArgKeyword)
       .getOrElse(throw new Exception("Missing required argument: " + JobTypeArgKeyword))
 
-    val jobId = JobSubmitter
-      .getArgValue(args, JobIdArgKeyword)
-      .getOrElse(s"chronon-job-${System.currentTimeMillis()}")
+    val jobType = jobTypeValue.toLowerCase match {
+      case "spark" => TypeSparkJob
+      case "flink" => TypeFlinkJob
+      case _       => throw new Exception("Invalid job type. Must be 'spark' or 'flink'.")
+    }
+
+    val submissionProps = createSubmissionPropsMap(jobType, args)
 
     val files = args.find(_.startsWith(FilesArgKeyword)) match {
       case None => Array.empty[String]
@@ -462,17 +559,6 @@ object EmrServerlessSubmitter {
             s"Malformed files argument: '$arg'. Expected format: ${FilesArgKeyword}=file1,file2")
         }
         arg.substring(eqIdx + 1).split(",")
-    }
-
-    val (jobType: JobType, submissionProps: Map[String, String]) = jobTypeValue.toLowerCase match {
-      case "spark" =>
-        val baseProps = Map(
-          MainClass -> mainClass,
-          JarURI -> jarUri,
-          JobId -> jobId
-        )
-        (TypeSparkJob, baseProps)
-      case _ => throw new Exception("Invalid job type. Only 'spark' is supported.")
     }
 
     val finalArgs = userArgs.toSeq
