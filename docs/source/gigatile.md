@@ -215,6 +215,81 @@ KV value: finalized feature vector (Avro encoded output schema)
 
 Single entry per entity. Overwritten on every emit. The fetcher reads one key, decodes, returns.
 
+## Scenario Tables
+
+All windows, tailBuffer = 2d, now = Mar 26 14:00.
+
+### Scenario 1: Batch fresh (batchEnd = Mar 26 00:00, 14h stale)
+
+Streaming covers [batchEnd, now) = [Mar 26 00:00, Mar 26 14:00) = 14h.
+`largeTodayIr` covers [Mar 26 00:00, Mar 26 14:00). `largeYesterdayIr` is empty (batch is fresh).
+
+| window | category | runningLargeIr composition | tail hops selected | streaming added |
+|--------|----------|----------------------------|--------------------|-----------------|
+| 6h | SMALL | — (uses cachedSmallWindowIr) | — | — |
+| 1d | SMALL | — | — | — |
+| 2d | SMALL | — | — | — |
+| 49h | LARGE | collapsed [Mar 24 23:00, Mar 26 00:00) + 1 hop [Mar 24 01:00, Mar 24 23:00) | hops where hopStart >= round(Mar 26 14:00 - 49h) = Mar 24 13:00 | + largeTodayIr [Mar 26 00:00, 14:00) |
+| 3d | LARGE | collapsed [Mar 24 00:00, Mar 26 00:00) + 24 hops [Mar 23 00:00, Mar 24 00:00) | hops where hopStart >= round(Mar 26 14:00 - 3d) = Mar 23 14:00 | + largeTodayIr |
+| 7d | LARGE | collapsed [Mar 20 00:00, Mar 26 00:00) + 48 hops [Mar 19 00:00, Mar 20 00:00) | hops where hopStart >= round(Mar 26 14:00 - 7d) = Mar 19 14:00 | + largeTodayIr |
+
+**On event at Mar 26 14:00:**
+- `runningLargeIr(49h)` = batch portion (collapsed + selected hops) + `largeTodayIr` contribution + new event
+- Emit: `finalize(pack(cachedSmallWindowIr, runningLargeIr))` → single KV write
+
+**On eviction at Mar 26 14:05:**
+- `queryTs` advanced by 5min → `queryTail` for 49h advances → no hop falls off (1hr hops)
+- `queryTail` for 3d advances → no hop falls off
+- `runningLargeIr` recomputed from batch hops + streaming. Same value (no tail shift). No-op.
+
+### Scenario 2: Batch stale (batchEnd = Mar 25 00:00, 38h stale)
+
+Streaming covers [batchEnd, now) = [Mar 25 00:00, Mar 26 14:00) = 38h.
+`largeYesterdayIr` covers [Mar 25 00:00, Mar 26 00:00). `largeTodayIr` covers [Mar 26 00:00, Mar 26 14:00).
+Both are included because `batchEnd < todayStart`.
+
+| window | category | runningLargeIr composition | tail hops selected | streaming added |
+|--------|----------|----------------------------|--------------------|-----------------|
+| 6h | SMALL | — | — | — |
+| 1d | SMALL | — | — | — |
+| 2d | SMALL | — | — | — |
+| 49h | LARGE | collapsed [Mar 22 23:00, Mar 25 00:00) + hops | hops where hopStart >= Mar 24 13:00 | + largeYesterdayIr + largeTodayIr |
+| 3d | LARGE | collapsed [Mar 23 00:00, Mar 25 00:00) + hops | hops where hopStart >= Mar 23 14:00 | + largeYesterdayIr + largeTodayIr |
+| 7d | LARGE | collapsed [Mar 19 00:00, Mar 25 00:00) + hops | hops where hopStart >= Mar 19 14:00 | + largeYesterdayIr + largeTodayIr |
+
+**On batch refresh (batchEnd advances Mar 25 → Mar 26 00:00):**
+1. Store new batchIr (collapsed now covers [Mar 20 00:00, Mar 26 00:00) for 7d window)
+2. Clear `largeYesterdayIr` — batch now covers [Mar 25 00:00, Mar 26 00:00)
+3. Recompute `runningLargeIr`:
+   - 49h: new collapsed + selected hops + largeTodayIr only (yesterday cleared)
+   - 3d: new collapsed + selected hops + largeTodayIr only
+4. Compare with old `runningLargeIr`
+5. Emit only if mismatch (likely: batch incorporated Mar 25's full data, replacing streaming's accumulation)
+
+### State transitions through a day
+
+```
+Time        Event                   runningLargeIr state
+─────────── ─────────────────────── ──────────────────────────────────────────────
+Mar 26 00:00  advanceWatermark       yesterday→today rotation. Running sum unchanged
+              (day transition)       (sawtooth: slightly over-inclusive at tail)
+
+Mar 26 00:05  eviction timer         Recompute from batch hops + streaming.
+                                     Tail hops re-selected with queryTs=00:05.
+                                     Running sum corrected.
+
+Mar 26 00:05  event arrives          Merge into largeTodayIr + runningLargeIr.
+  to 06:00    (continuous)           Emit finalized vector on each event.
+
+Mar 26 06:00  batch refresh          New batchIr loaded from Iceberg.
+              (Iceberg snapshot)     Clear largeYesterdayIr.
+                                     Recompute running sum.
+                                     Emit only if value changed.
+
+Mar 26 06:00  events continue        runningLargeIr updated incrementally.
+  to 24:00                           Eviction corrects tail every minTileSize.
+```
+
 ## Comparison with Mega Tile
 
 | | Mega tile (current) | Giga tile (proposed) |
