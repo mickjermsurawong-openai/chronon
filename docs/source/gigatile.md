@@ -166,10 +166,13 @@ def onBatchUpdate(newBatchIr, newBatchEnd):
   batchIr = newBatchIr
   batchEndTs = newBatchEnd
 
-  // Rotate streaming state — batch now covers what yesterday covered
-  largeYesterdayIr = init
-  if newBatchEnd > currentDayStart:
-    largeTodayIr = init    // batch overlaps today — clear and rebuild from events
+  // Clear streaming accumulators that batch now covers.
+  // Only clear yesterday if batch actually covers through yesterday's range.
+  // Only clear today if batch covers into today (unusual — requires watermark lag).
+  if newBatchEnd >= currentDayStart:
+    largeYesterdayIr = init    // batch covers through yesterday
+  // largeTodayIr is NOT cleared — batchEnd falls on a day boundary (partition date),
+  // and largeTodayIr covers [currentDayStart, now) which is post-batchEnd.
 
   // Recompute running sum: new batch + remaining streaming
   runningLargeIr = clone(newBatchIr.collapsed)
@@ -180,6 +183,11 @@ def onBatchUpdate(newBatchIr, newBatchEnd):
   // Emit only on mismatch — most entities won't change materially
   if !equal(oldRunningLargeIr, runningLargeIr):
     emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
+
+  // Register eviction timer for batch-only entities (no streaming events to trigger it).
+  // Without this, tail hops go stale as queryTs drifts from the batch-load-time value.
+  if hasSmallWindows:
+    registerEvictionTimer(now + minSmallWindowTileSize)
 ```
 
 ### Day Transition (advanceWatermark)
@@ -318,16 +326,89 @@ Mar 26 06:00  events continue        runningLargeIr updated incrementally.
 - Mismatch check + conditional emit. Most entities won't emit.
 - Spread over the Iceberg scan duration (~minutes). Not bursty.
 
-## Bootstrapping
+## Bootstrapping and Cold Start Recovery
 
-On Flink job startup:
-1. Iceberg source emits all entities' batch IRs (bounded scan)
-2. Each entity's `batchIr` state is populated
-3. `runningLargeIr` is computed from batch IR (no streaming yet)
-4. Emitted to KV store — all entities are immediately servable
-5. As streaming events arrive, `runningLargeIr` is incrementally updated
+### The problem
 
-No Kafka replay needed. No warm-up period for serving.
+In both mega tile and giga tile, a stateless restart (no checkpoint/savepoint) creates a gap:
+Kafka events from `[last_emit, restart_time)` are consumed and gone. Flink has no state for them.
+
+- **Mega tile**: fetcher re-reads batch KV on every query, so large windows recover immediately.
+  Small windows (streaming-only) lose data until events refill the window. The first new event
+  overwrites the old streaming KV entry, causing a sudden drop.
+- **Giga tile**: the fetcher serves whatever's in KV (last-emitted vector). ALL windows are stale
+  until Flink catches up. No fallback.
+
+Giga tile makes this worse because the fetcher has no independent data path to compensate.
+
+### Fix: Kafka replay from batchEnd on cold start
+
+On cold start (no checkpoint to restore), Flink must replay Kafka events to reconstruct
+streaming state before emitting to KV.
+
+```
+Cold start sequence:
+1. Flink starts with no state
+2. Iceberg source loads batch IRs for all entities
+   → batchEndTs known per entity (or globally if same GroupBy)
+3. Kafka consumer start offset = timestamp(batchEndTs)
+   → replays events from [batchEndTs, now)
+4. Flink processes replayed events, building tiles + accumulators
+   → does NOT emit to KV during replay (suppress until caught up)
+5. Watermark reaches near-realtime (within eviction interval of wall clock)
+   → Flink transitions to normal mode: emit on every event
+```
+
+**Suppress-until-caught-up** is critical. Without it, the KV store sees progressively-building
+vectors during replay — the fetcher would serve fluctuating values (e.g., `sum_7d` climbing
+from 0 to 5000 over 30 seconds of replay). With suppression, the KV entry stays at the
+last-emitted value from the previous run until Flink is fully caught up.
+
+Detection: Flink is "caught up" when `currentWatermark >= System.currentTimeMillis() - maxLag`
+where `maxLag` is configurable (e.g., 1 minute). This is a standard Flink pattern for
+distinguishing replay from live processing.
+
+### Kafka retention requirement
+
+Kafka topic retention must be ≥ max batch staleness (typically 2 days). This ensures that
+on cold start, events from `[batchEnd, now)` are available for replay. If retention is shorter,
+the gap between Kafka's oldest available offset and `batchEnd` creates a data hole.
+
+For GroupBys with only small windows (≤ 2d), Kafka retention must cover the max window size.
+These windows are self-contained in streaming — batch doesn't help.
+
+### Checkpoint restore (normal case)
+
+When restoring from a checkpoint/savepoint, Flink resumes from the checkpointed Kafka offsets.
+No gap. No replay needed. The Iceberg source re-scans for any batch updates that landed
+during downtime.
+
+### State transitions
+
+```
+                    ┌──────────────────────────────────────────────┐
+                    │          Cold start (no checkpoint)          │
+                    │                                              │
+                    │  1. Load batch IRs from Iceberg              │
+                    │  2. Set Kafka offset to batchEndTs           │
+                    │  3. Replay events [batchEnd, now)            │
+                    │  4. Suppress KV writes during replay         │
+                    │                                              │
+                    │  ── watermark catches up to wall clock ──    │
+                    │                                              │
+                    │  5. Transition to normal mode                │
+                    │  6. Emit to KV on events + eviction          │
+                    └──────────────────────────────────────────────┘
+
+                    ┌──────────────────────────────────────────────┐
+                    │       Checkpoint restore (normal case)        │
+                    │                                              │
+                    │  1. Restore Flink state from checkpoint      │
+                    │  2. Resume Kafka from checkpointed offsets   │
+                    │  3. Iceberg re-scan for batch updates        │
+                    │  4. Immediately emit — no gap                │
+                    └──────────────────────────────────────────────┘
+```
 
 ## Implementation Path
 
