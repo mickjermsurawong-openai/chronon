@@ -60,23 +60,46 @@ Fetcher: read → return
 
 ## Batch IR Ingestion
 
-Flink reads the batch IR table from Iceberg using a connected keyed stream.
-Both real events and batch updates flow through the same `keyBy(entityKey)` routing.
+Flink reads the batch IR from the **existing GroupByUpload Iceberg table** — the same table
+that Spark already writes to. No new tables, no new Spark changes.
 
 ```
-Stream 1: real events (Kafka)                → keyBy(entityKey) ──┐
-                                                                   ├→ CoProcessFunction
-Stream 2: batch IR (Iceberg, periodic scan)  → keyBy(entityKey) ──┘
+GroupByUpload (Spark)
+  │  Writes partition ds=YYYY-MM-DD to Iceberg upload table
+  │  Columns: key_bytes, value_bytes, key_json, value_json, ds
+  │  Iceberg commits a new snapshot on write
+  │
+  ▼
+Flink-Iceberg Source (streaming monitor mode)
+  │  monitorInterval = 30 min
+  │  On startup: full table scan (latest ds partition) → all entities
+  │  On new snapshot: incremental read → only new/changed files
+  │
+  │  Decode key_bytes → entityKey
+  │  keyBy(entityKey) → network shuffle to correct task slot
+  │
+  ▼
+CoProcessFunction (same task slot as Kafka events for this entity)
+  │  processElement1: Kafka event → onEvent
+  │  processElement2: batch IR row → onBatchUpdate
 ```
 
-The Iceberg source uses streaming monitor mode: periodically checks for new snapshots
-(e.g., every 30 minutes) and emits new/changed rows. This means:
-- On startup: full table scan → every entity gets its batch IR loaded
-- After GroupByUpload: incremental snapshot → only changed entities re-emitted
-- Entities that only exist in batch (no streaming events) still get a Flink key slot
+```
+Stream 1: real events (Kafka)                            → keyBy(entityKey) ──┐
+                                                                               ├→ CoProcessFunction
+Stream 2: batch IR (Iceberg upload table, monitor mode)  → keyBy(entityKey) ──┘
+```
 
-This solves the key superset problem: Flink doesn't need to have seen a streaming event
-to serve an entity. The batch IR stream bootstraps all entities.
+**Why this works without any Spark changes:**
+- GroupByUpload already writes `(key_bytes, value_bytes)` to an Iceberg table partitioned by `ds`
+- Each write commits an Iceberg snapshot (standard Iceberg behavior)
+- Flink's Iceberg source detects new snapshots and reads the new data
+- `value_bytes` contains Avro-encoded `FinalBatchIr` — same format the fetcher reads today
+- `key_bytes` contains Avro-encoded entity keys — same encoding as the Kafka event keys
+
+**Key superset:** The Iceberg source emits ALL entities from the batch table. Entities that
+only exist in batch (no streaming events) get a Flink key slot via the batch stream.
+This solves the key superset problem without requiring Kafka events for every entity.
 
 ## State Layout
 
@@ -405,21 +428,105 @@ When restoring from a checkpoint/savepoint, Flink resumes from the checkpointed 
 No gap. No replay needed. The Iceberg source re-scans for any batch updates that landed
 during downtime.
 
+### First-ever startup (no prior state, no prior KV entries)
+
+This is the greenfield case: the giga tile Flink job starts for the first time. The KV store
+has no giga tile entries. The batch upload table has historical batch IRs.
+
+```
+First startup sequence:
+
+1. Iceberg source scans the upload table (latest ds partition)
+   → emits (key_bytes, value_bytes) for ALL entities
+   → includes the GroupByServingInfo metadata row (filtered out by key)
+   → N entities × ~1KB = ~1GB for 1M entities. One-time bounded scan.
+
+2. keyBy(entityKey) routes each batch IR to the correct task slot
+   → CoProcessFunction.processElement2 fires for each entity
+   → onBatchUpdate stores batchIr, computes runningLargeIr
+   → entities with no streaming events: emit finalized vector immediately
+   → KV store now has entries for ALL batch entities (batch-only answer)
+
+3. Kafka consumer starts from batchEndTs offset
+   → replays events from [batchEnd, now)
+   → KV writes suppressed during replay
+
+4. Watermark catches up to wall clock
+   → suppress lifted
+   → entities that had streaming events now emit full (batch + streaming) vectors
+   → KV store has correct entries for all entities
+```
+
+**Key question: will all keys be in the KV store?**
+
+Yes, because:
+- The Iceberg source emits ALL entities from the batch table (step 1)
+- Each entity triggers `onBatchUpdate` which emits to KV (step 2)
+- Batch-only entities get their vector from step 2 and never need streaming
+- Streaming entities get an initial batch-only vector (step 2), then a corrected
+  batch+streaming vector after replay (step 4)
+
+**What about entities in Kafka but NOT in batch?**
+
+These are brand-new entities that have streaming events but no batch history.
+- Their first Kafka event creates Flink state
+- `batchIr` is null → `runningLargeIr` = streaming only
+- The emitted vector is streaming-only (correct for new entities with no history)
+- When the next batch run picks them up, `onBatchUpdate` adds the batch component
+
+**Timing between Iceberg scan and Kafka replay:**
+
+The Iceberg scan and Kafka replay happen concurrently (two input streams).
+For any given entity, events might arrive before the batch IR:
+- Event arrives first → `batchIr` is null → streaming-only answer emitted
+  (but KV writes are suppressed during replay, so this isn't served)
+- Batch IR arrives during replay → `onBatchUpdate` stores it, but defers
+  recomputation if watermark hasn't caught up
+- After watermark catches up: eviction triggers full recomputation with
+  both batch and streaming → correct vector emitted
+
+The suppress-until-caught-up mechanism ensures the fetcher never sees
+intermediate/incomplete vectors during the startup window.
+
+**KV store population timeline (first startup):**
+
+```
+Time          KV state
+──────────    ──────────────────────────────────────────────────
+T+0           Empty (no prior entries)
+T+1 min       Batch-only entities start appearing (Iceberg scan in progress)
+              Streaming entities: suppressed (Kafka replay in progress)
+T+5 min       Iceberg scan complete. All batch entities have KV entries.
+              These are batch-only answers (no streaming component).
+T+10 min      Kafka replay complete. Watermark caught up.
+              Streaming entities now emit full batch+streaming vectors.
+              All entities have correct KV entries.
+```
+
 ### State transitions
 
 ```
                     ┌──────────────────────────────────────────────┐
-                    │          Cold start (no checkpoint)          │
+                    │        First startup (greenfield)             │
                     │                                              │
-                    │  1. Load batch IRs from Iceberg              │
-                    │  2. Set Kafka offset to batchEndTs           │
-                    │  3. Replay events [batchEnd, now)            │
-                    │  4. Suppress KV writes during replay         │
+                    │  1. Iceberg scan: load all batch IRs         │
+                    │  2. Batch-only entities: emit immediately    │
+                    │  3. Kafka replay from batchEndTs             │
+                    │  4. Suppress streaming KV writes             │
                     │                                              │
                     │  ── watermark catches up to wall clock ──    │
                     │                                              │
-                    │  5. Transition to normal mode                │
-                    │  6. Emit to KV on events + eviction          │
+                    │  5. Emit batch+streaming vectors             │
+                    │  6. All entities now in KV store             │
+                    └──────────────────────────────────────────────┘
+
+                    ┌──────────────────────────────────────────────┐
+                    │          Cold restart (no checkpoint)         │
+                    │                                              │
+                    │  Same as first startup, but KV store has     │
+                    │  stale entries from previous run.             │
+                    │  Batch-only entities: overwrite stale entry  │
+                    │  Streaming entities: stale until replay done │
                     └──────────────────────────────────────────────┘
 
                     ┌──────────────────────────────────────────────┐
