@@ -152,43 +152,65 @@ def onEviction(timerTs):
 
 ### On Batch IR Update (daily, from Iceberg stream)
 
-Recomputes `runningLargeIr` with the new batch data. Emits only if the merged value changed.
+Stores the new batch IR immediately. Recomputation of `runningLargeIr` is deferred if the
+watermark hasn't caught up to the new `batchEnd` (prevents double-counting from overlap
+between batch and `largeTodayIr`). The next eviction picks it up.
 
 ```
 def onBatchUpdate(newBatchIr, newBatchEnd):
   oldBatchEnd = batchEndTs
   if newBatchEnd <= oldBatchEnd: return   // same or older batch, skip
 
-  // Save old running sum for comparison
-  oldRunningLargeIr = clone(runningLargeIr)
-
-  // Store new batch state
+  // Always store the new batch IR — eviction and future events use it.
   batchIr = newBatchIr
   batchEndTs = newBatchEnd
 
-  // Clear streaming accumulators that batch now covers.
-  // Only clear yesterday if batch actually covers through yesterday's range.
-  // Only clear today if batch covers into today (unusual — requires watermark lag).
-  if newBatchEnd >= currentDayStart:
-    largeYesterdayIr = init    // batch covers through yesterday
-  // largeTodayIr is NOT cleared — batchEnd falls on a day boundary (partition date),
-  // and largeTodayIr covers [currentDayStart, now) which is post-batchEnd.
+  // Register eviction timer for batch-only entities (no streaming events to trigger it).
+  if hasSmallWindows:
+    registerEvictionTimer(now + minSmallWindowTileSize)
 
-  // Recompute running sum: new batch + remaining streaming
+  if newBatchEnd > currentDayStart:
+    // Batch is ahead of watermark (race: Iceberg delivered before watermark caught up).
+    // largeTodayIr covers [currentDayStart, now) which overlaps with batch [.., newBatchEnd).
+    // Cannot recompute without double-counting for non-invertible aggregations.
+    // Defer — the next eviction will recompute with correct boundaries after
+    // advanceWatermark moves currentDayStart past newBatchEnd.
+    return
+
+  // Safe: newBatchEnd <= currentDayStart — no overlap between batch and largeTodayIr.
+
+  // Save old running sum for comparison
+  oldRunningLargeIr = clone(runningLargeIr)
+
+  // Clear yesterday if batch now covers it
+  if newBatchEnd >= currentDayStart:
+    largeYesterdayIr = init
+
+  // Recompute running sum: new batch + tail hops + streaming
   runningLargeIr = clone(newBatchIr.collapsed)
-  mergeTailHops(runningLargeIr, queryTs=now, batchEndTs=newBatchEnd, newBatchIr)
+  mergeTailHops(runningLargeIr, queryTs=watermark, batchEndTs=newBatchEnd, newBatchIr)
   for col where !isNoBatch(col):
     runningLargeIr(col) = merge(runningLargeIr(col), largeTodayIr(col))
+    // Include yesterday if batch doesn't cover it
+    if newBatchEnd < currentDayStart and largeYesterdayIr(col) != null:
+      runningLargeIr(col) = merge(runningLargeIr(col), largeYesterdayIr(col))
 
   // Emit only on mismatch — most entities won't change materially
   if !equal(oldRunningLargeIr, runningLargeIr):
     emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
-
-  // Register eviction timer for batch-only entities (no streaming events to trigger it).
-  // Without this, tail hops go stale as queryTs drifts from the batch-load-time value.
-  if hasSmallWindows:
-    registerEvictionTimer(now + minSmallWindowTileSize)
 ```
+
+**Why defer when `newBatchEnd > currentDayStart`?**
+
+`largeTodayIr` covers `[currentDayStart, now)`. If `newBatchEnd > currentDayStart`, batch covers
+`[..., newBatchEnd)` which overlaps with `[currentDayStart, newBatchEnd)` in `largeTodayIr`.
+We can't subtract the overlap (non-invertible aggregations). We can't clear `largeTodayIr`
+(loses post-`batchEnd` events). So we wait for the watermark to advance past `newBatchEnd`,
+which rotates `largeTodayIr` via `advanceWatermark`. The next eviction then recomputes cleanly.
+
+In normal operation, this defer never triggers: batch lands at ~6 AM, watermark passed midnight
+hours ago, `newBatchEnd = currentDayStart`. The defer is a safety net for the narrow race window
+when batch arrives just before the watermark crosses midnight.
 
 ### Day Transition (advanceWatermark)
 
