@@ -457,18 +457,22 @@ First startup sequence:
    → KV store has correct entries for all entities
 ```
 
+**Note:** Giga tile only applies to `Accuracy.TEMPORAL` GroupBys (those with a streaming topic).
+`SNAPSHOT` GroupBys have no Flink job — they go through the traditional `bulkPut` path
+directly from Spark to KV store.
+
 **Key question: will all keys be in the KV store?**
 
-Yes, because:
-- The Iceberg source emits ALL entities from the batch table (step 1)
-- Each entity triggers `onBatchUpdate` which emits to KV (step 2)
-- Batch-only entities get their vector from step 2 and never need streaming
-- Streaming entities get an initial batch-only vector (step 2), then a corrected
-  batch+streaming vector after replay (step 4)
+Yes, for all temporal entities:
+- **Inactive entities** (in batch table, no recent streaming events): the Iceberg source
+  emits their batch IR → Flink computes a batch-only vector → emits to KV (step 2).
+  These entities have a topic but haven't sent events recently.
+- **Active entities** (have streaming events): get an initial batch-only vector (step 2),
+  then a corrected batch+streaming vector after Kafka replay (step 4).
 
 **What about entities in Kafka but NOT in batch?**
 
-These are brand-new entities that have streaming events but no batch history.
+Brand-new entities that have streaming events but no batch history yet:
 - Their first Kafka event creates Flink state
 - `batchIr` is null → `runningLargeIr` = streaming only
 - The emitted vector is streaming-only (correct for new entities with no history)
