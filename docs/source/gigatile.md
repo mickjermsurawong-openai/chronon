@@ -387,17 +387,14 @@ The serving layer doesn't route traffic until the orchestrator signals "ready."
 
 ```
 def onBatchUpdate(newBatchIr, newBatchEnd):
-  hadBatchBefore = (batchIr != null)
+  oldRunningLargeIr = clone(runningLargeIr)
 
   // ... existing logic: store, defer if watermark lag, recompute ...
 
-  if !hadBatchBefore:
-    // First batch IR for this entity — emit the best available answer
+  // Single rule: emit if the merged answer changed.
+  // Covers null→value (first batch load), batch correction, tail shift, etc.
+  if !equal(oldRunningLargeIr, runningLargeIr):
     emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
-  else:
-    // Subsequent update — emit only on mismatch
-    if !equal(oldRunningLargeIr, runningLargeIr):
-      emit(...)
 ```
 
 ### Readiness signal
