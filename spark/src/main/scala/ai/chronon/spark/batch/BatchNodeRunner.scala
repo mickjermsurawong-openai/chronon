@@ -224,7 +224,7 @@ class BatchNodeRunner(node: Node, tableUtils: TableUtils, api: Api) extends Node
     val groupBy = groupByUpload.groupBy
     logger.info(s"Running groupBy upload for '${metadata.name}' for day: ${range.end}")
 
-    GroupByUpload.run(groupBy, range.end, Option(tableUtils))
+    GroupByUpload.run(groupBy, range.end, Option(tableUtils), apiOpt = Option(api))
     logger.info(s"Successfully completed groupBy upload for '${metadata.name}' for day: ${range.end}")
   }
 
