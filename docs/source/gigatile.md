@@ -371,176 +371,130 @@ Mar 26 06:00  events continue        runningLargeIr updated incrementally.
 - Mismatch check + conditional emit. Most entities won't emit.
 - Spread over the Iceberg scan duration (~minutes). Not bursty.
 
-## Bootstrapping and Cold Start Recovery
+## Bootstrapping and Startup
 
-### The problem
+### Emit strategy
 
-In both mega tile and giga tile, a stateless restart (no checkpoint/savepoint) creates a gap:
-Kafka events from `[last_emit, restart_time)` are consumed and gone. Flink has no state for them.
+No suppress logic inside Flink. Flink always emits when it has something to emit.
+The serving layer doesn't route traffic until the orchestrator signals "ready."
 
-- **Mega tile**: fetcher re-reads batch KV on every query, so large windows recover immediately.
-  Small windows (streaming-only) lose data until events refill the window. The first new event
-  overwrites the old streaming KV entry, causing a sudden drop.
-- **Giga tile**: the fetcher serves whatever's in KV (last-emitted vector). ALL windows are stale
-  until Flink catches up. No fallback.
-
-Giga tile makes this worse because the fetcher has no independent data path to compensate.
-
-### Fix: Kafka replay from batchEnd on cold start
-
-On cold start (no checkpoint to restore), Flink must replay Kafka events to reconstruct
-streaming state before emitting to KV.
+**Emit triggers:**
+- **Batch IR null→value** (first batch load for an entity): always emit. Covers both
+  initial startup (Iceberg scan) and new entities picked up by a later batch run.
+- **Event arrival**: emit on every event (existing mega tile behavior).
+- **Eviction timer**: emit on periodic eviction (existing).
+- **Batch IR update** (daily refresh): emit only on mismatch (existing).
 
 ```
-Cold start sequence:
+def onBatchUpdate(newBatchIr, newBatchEnd):
+  hadBatchBefore = (batchIr != null)
+
+  // ... existing logic: store, defer if watermark lag, recompute ...
+
+  if !hadBatchBefore:
+    // First batch IR for this entity — emit the best available answer
+    emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
+  else:
+    // Subsequent update — emit only on mismatch
+    if !equal(oldRunningLargeIr, runningLargeIr):
+      emit(...)
+```
+
+### Readiness signal
+
+The Flink job exposes a readiness condition: **initial Iceberg scan complete AND watermark
+caught up** (within configurable `maxLag` of wall clock). The orchestrator checks this
+before routing model traffic to the giga tile KV dataset.
+
+```
+isReady = icebergInitialScanComplete
+          AND currentWatermark >= System.currentTimeMillis() - maxLag
+```
+
+This is a metric/health endpoint — not part of the emit logic. Flink doesn't gate emits
+on readiness. It writes to KV freely. The orchestrator decides when to trust the output.
+
+### Kafka replay on cold start
+
+On cold start (no checkpoint), Flink replays Kafka from `batchEndTs` to reconstruct
+streaming state. During replay, Flink emits progressively-building vectors. This is fine
+because the orchestrator hasn't signaled "ready" yet — no traffic is routed.
+
+```
+Cold start / first startup:
 1. Flink starts with no state
-2. Iceberg source loads batch IRs for all entities
-   → batchEndTs known per entity (or globally if same GroupBy)
-3. Kafka consumer start offset = timestamp(batchEndTs)
-   → replays events from [batchEndTs, now)
-4. Flink processes replayed events, building tiles + accumulators
-   → does NOT emit to KV during replay (suppress until caught up)
-5. Watermark reaches near-realtime (within eviction interval of wall clock)
-   → Flink transitions to normal mode: emit on every event
+2. Iceberg source scans upload table (latest ds partition)
+   → all entities get batch IR via onBatchUpdate
+   → null→value trigger: each entity emits batch-only vector
+3. Kafka consumer starts from batchEndTs offset
+   → replays events from [batchEnd, now)
+   → each event emits updated vector (progressively improving)
+4. Watermark catches up + Iceberg scan done → isReady = true
+5. Orchestrator routes traffic → fetcher reads correct vectors
 ```
 
-**Suppress-until-caught-up** is critical. Without it, the KV store sees progressively-building
-vectors during replay — the fetcher would serve fluctuating values (e.g., `sum_7d` climbing
-from 0 to 5000 over 30 seconds of replay). With suppression, the KV entry stays at the
-last-emitted value from the previous run until Flink is fully caught up.
-
-Detection: Flink is "caught up" when `currentWatermark >= System.currentTimeMillis() - maxLag`
-where `maxLag` is configurable (e.g., 1 minute). This is a standard Flink pattern for
-distinguishing replay from live processing.
+During replay (steps 2-3), the KV store has intermediate vectors. Nobody reads them
+because readiness hasn't been signaled.
 
 ### Kafka retention requirement
 
-Kafka topic retention must be ≥ max batch staleness (typically 2 days). This ensures that
-on cold start, events from `[batchEnd, now)` are available for replay. If retention is shorter,
-the gap between Kafka's oldest available offset and `batchEnd` creates a data hole.
+Kafka topic retention must be ≥ max batch staleness (typically 2 days). This ensures
+events from `[batchEnd, now)` are available for replay. For GroupBys with only small
+windows (≤ 2d), retention must cover the max window size.
 
-For GroupBys with only small windows (≤ 2d), Kafka retention must cover the max window size.
-These windows are self-contained in streaming — batch doesn't help.
+### Key completeness
 
-### Checkpoint restore (normal case)
-
-When restoring from a checkpoint/savepoint, Flink resumes from the checkpointed Kafka offsets.
-No gap. No replay needed. The Iceberg source re-scans for any batch updates that landed
-during downtime.
-
-### First-ever startup (no prior state, no prior KV entries)
-
-This is the greenfield case: the giga tile Flink job starts for the first time. The KV store
-has no giga tile entries. The batch upload table has historical batch IRs.
-
-```
-First startup sequence:
-
-1. Iceberg source scans the upload table (latest ds partition)
-   → emits (key_bytes, value_bytes) for ALL entities
-   → includes the GroupByServingInfo metadata row (filtered out by key)
-   → N entities × ~1KB = ~1GB for 1M entities. One-time bounded scan.
-
-2. keyBy(entityKey) routes each batch IR to the correct task slot
-   → CoProcessFunction.processElement2 fires for each entity
-   → onBatchUpdate stores batchIr, computes runningLargeIr
-   → entities with no streaming events: emit finalized vector immediately
-   → KV store now has entries for ALL batch entities (batch-only answer)
-
-3. Kafka consumer starts from batchEndTs offset
-   → replays events from [batchEnd, now)
-   → KV writes suppressed during replay
-
-4. Watermark catches up to wall clock
-   → suppress lifted
-   → entities that had streaming events now emit full (batch + streaming) vectors
-   → KV store has correct entries for all entities
-```
-
-**Note:** Giga tile only applies to `Accuracy.TEMPORAL` GroupBys (those with a streaming topic).
-`SNAPSHOT` GroupBys have no Flink job — they go through the traditional `bulkPut` path
-directly from Spark to KV store.
-
-**Key question: will all keys be in the KV store?**
+**Will all keys be in the KV store after startup?**
 
 Yes, for all temporal entities:
-- **Inactive entities** (in batch table, no recent streaming events): the Iceberg source
-  emits their batch IR → Flink computes a batch-only vector → emits to KV (step 2).
-  These entities have a topic but haven't sent events recently.
-- **Active entities** (have streaming events): get an initial batch-only vector (step 2),
-  then a corrected batch+streaming vector after Kafka replay (step 4).
+- **Inactive entities** (in batch table, no recent streaming events): Iceberg source
+  emits their batch IR → null→value trigger → batch-only vector emitted to KV.
+- **Active entities**: batch-only vector first (Iceberg), then corrected with streaming
+  during Kafka replay.
+- **New entities (in Kafka, not in batch)**: first event creates Flink state. `batchIr`
+  is null → streaming-only vector emitted. Correct for entities with no history.
+  Next batch run picks them up via onBatchUpdate (null→value trigger).
 
-**What about entities in Kafka but NOT in batch?**
+**Note:** Giga tile only applies to `Accuracy.TEMPORAL` GroupBys (with a streaming topic).
+`SNAPSHOT` GroupBys bypass Flink — they use the traditional `bulkPut` from Spark to KV.
 
-Brand-new entities that have streaming events but no batch history yet:
-- Their first Kafka event creates Flink state
-- `batchIr` is null → `runningLargeIr` = streaming only
-- The emitted vector is streaming-only (correct for new entities with no history)
-- When the next batch run picks them up, `onBatchUpdate` adds the batch component
-
-**Timing between Iceberg scan and Kafka replay:**
-
-The Iceberg scan and Kafka replay happen concurrently (two input streams).
-For any given entity, events might arrive before the batch IR:
-- Event arrives first → `batchIr` is null → streaming-only answer emitted
-  (but KV writes are suppressed during replay, so this isn't served)
-- Batch IR arrives during replay → `onBatchUpdate` stores it, but defers
-  recomputation if watermark hasn't caught up
-- After watermark catches up: eviction triggers full recomputation with
-  both batch and streaming → correct vector emitted
-
-The suppress-until-caught-up mechanism ensures the fetcher never sees
-intermediate/incomplete vectors during the startup window.
-
-**KV store population timeline (first startup):**
+### Startup timeline
 
 ```
-Time          KV state
-──────────    ──────────────────────────────────────────────────
-T+0           Empty (no prior entries)
-T+1 min       Batch-only entities start appearing (Iceberg scan in progress)
-              Streaming entities: suppressed (Kafka replay in progress)
-T+5 min       Iceberg scan complete. All batch entities have KV entries.
-              These are batch-only answers (no streaming component).
-T+10 min      Kafka replay complete. Watermark caught up.
-              Streaming entities now emit full batch+streaming vectors.
-              All entities have correct KV entries.
+Time          KV state                              isReady
+──────────    ──────────────────────────────────     ───────
+T+0           Empty                                  false
+T+1 min       Batch-only vectors appearing           false
+              (Iceberg scan in progress)
+T+5 min       All batch entities in KV               false
+              (Iceberg scan complete)
+              Streaming entities: partial
+              (Kafka replay in progress)
+T+10 min      All entities fully correct             true
+              (watermark caught up)
+              Orchestrator routes traffic
 ```
 
 ### State transitions
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │        First startup (greenfield)             │
-                    │                                              │
-                    │  1. Iceberg scan: load all batch IRs         │
-                    │  2. Batch-only entities: emit immediately    │
-                    │  3. Kafka replay from batchEndTs             │
-                    │  4. Suppress streaming KV writes             │
-                    │                                              │
-                    │  ── watermark catches up to wall clock ──    │
-                    │                                              │
-                    │  5. Emit batch+streaming vectors             │
-                    │  6. All entities now in KV store             │
-                    └──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│   First startup / cold restart                │
+│                                              │
+│   1. Iceberg scan: batch IRs → KV           │
+│   2. Kafka replay: streaming → KV           │
+│   3. Both complete → isReady = true          │
+│   4. Orchestrator routes traffic             │
+└──────────────────────────────────────────────┘
 
-                    ┌──────────────────────────────────────────────┐
-                    │          Cold restart (no checkpoint)         │
-                    │                                              │
-                    │  Same as first startup, but KV store has     │
-                    │  stale entries from previous run.             │
-                    │  Batch-only entities: overwrite stale entry  │
-                    │  Streaming entities: stale until replay done │
-                    └──────────────────────────────────────────────┘
-
-                    ┌──────────────────────────────────────────────┐
-                    │       Checkpoint restore (normal case)        │
-                    │                                              │
-                    │  1. Restore Flink state from checkpoint      │
-                    │  2. Resume Kafka from checkpointed offsets   │
-                    │  3. Iceberg re-scan for batch updates        │
-                    │  4. Immediately emit — no gap                │
-                    └──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│   Checkpoint restore (normal)                 │
+│                                              │
+│   1. Restore state from checkpoint           │
+│   2. Resume Kafka from checkpointed offsets  │
+│   3. Iceberg re-scan for batch updates       │
+│   4. isReady = true immediately              │
+└──────────────────────────────────────────────┘
 ```
 
 ## Implementation Path
