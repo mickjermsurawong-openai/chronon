@@ -55,8 +55,11 @@ case class GigaTileAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParse
             s"tsMills=$tsMills valueBytes=${value.tileBytes.length} bytes")
       }
 
-      // Plain entity key — no TileKey wrapper. Single entry per entity, overwritten on every emit.
-      out.collect(new AvroCodecOutput(entityKeyBytes, value.tileBytes, streamingDataset, tsMills,
+      // Plain entity key — no TileKey wrapper. Single entry per entity.
+      // Fixed timestamp (0L) ensures KV stores that version by timestamp (BigTable cells,
+      // DynamoDB sort keys) overwrite instead of append. Without this, every event creates
+      // a new version, defeating the single-get promise.
+      out.collect(new AvroCodecOutput(entityKeyBytes, value.tileBytes, streamingDataset, 0L,
         value.startProcessingTime))
     } catch {
       case e: Exception =>
