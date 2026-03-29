@@ -339,7 +339,10 @@ object FlinkJob {
       maybeServingInfo
         .map { servingInfo =>
           // create the groupby dataset on the KV store if it doesn't exist prior to starting up the job
-          kvStore.create(servingInfo.groupBy.streamingDataset)
+          if (new GroupByOps(servingInfo.groupBy).isPushEnabled)
+            kvStore.create(servingInfo.groupByOps.pushDataset)
+          else
+            kvStore.create(servingInfo.groupBy.streamingDataset)
           buildFlinkJob(groupByName, props, api, servingInfo, enableDebug, jobArgs.topicOverride.toOption)
         }
         .recover { case e: Exception =>

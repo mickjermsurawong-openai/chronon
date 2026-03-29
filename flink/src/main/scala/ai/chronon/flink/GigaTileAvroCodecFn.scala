@@ -15,6 +15,7 @@ import org.slf4j.{Logger, LoggerFactory}
 /** Converts giga tile output (TimestampedTile with finalized vector bytes) to KV PutRequests.
   * Key: plain entity key bytes (no TileKey wrapper, no day suffix).
   * Value: finalized feature vector bytes (passthrough).
+  * Dataset: pushDataset (*_PUSH) — simple key→value, no time-series sort key.
   */
 case class GigaTileAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParsed, enableDebug: Boolean = false)
     extends RichFlatMapFunction[TimestampedTile, AvroCodecOutput] {
@@ -23,9 +24,10 @@ case class GigaTileAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParse
   @transient private var avroConversionErrorCounter: Counter = _
   @transient private var eventProcessingErrorCounter: Counter = _
 
-  private lazy val streamingDataset: String = groupByServingInfoParsed.groupBy.streamingDataset
-  private lazy val keyColumns: Array[String] =
-    SparkExpressionEval.buildKeyValueEventTimeColumns(groupByServingInfoParsed.groupBy)._1
+  // Use pushDataset (*_PUSH) — not streamingDataset (*_STREAMING).
+  // _STREAMING tables in DynamoDB have a sort key (timestamp) causing GetItem failures
+  // on plain entity keys. _PUSH tables are simple key→value stores.
+  private lazy val dataset: String = groupByServingInfoParsed.groupByOps.pushDataset
   private lazy val keyToBytes: Any => Array[Byte] = {
     val keyZSchema: ChrononStructType = groupByServingInfoParsed.keyChrononSchema
     AvroConversions.encodeBytes(keyZSchema,
@@ -46,24 +48,21 @@ case class GigaTileAvroCodecFn(groupByServingInfoParsed: GroupByServingInfoParse
 
   override def flatMap(value: TimestampedTile, out: Collector[AvroCodecOutput]): Unit =
     try {
-      val tsMills = value.latestTsMillis
       val entityKeyBytes = keyToBytes(value.keys.toArray)
 
       if (enableDebug) {
         logger.info(
-          s"Giga tile PutRequest: groupBy=${groupByServingInfoParsed.groupBy.getMetaData.getName} " +
-            s"tsMills=$tsMills valueBytes=${value.tileBytes.length} bytes")
+          s"Push PutRequest: groupBy=${groupByServingInfoParsed.groupBy.getMetaData.getName} " +
+            s"valueBytes=${value.tileBytes.length} bytes")
       }
 
-      // Plain entity key — no TileKey wrapper. Single entry per entity.
-      // Fixed timestamp (0L) ensures KV stores that version by timestamp (BigTable cells,
-      // DynamoDB sort keys) overwrite instead of append. Without this, every event creates
-      // a new version, defeating the single-get promise.
-      out.collect(new AvroCodecOutput(entityKeyBytes, value.tileBytes, streamingDataset, 0L,
-        value.startProcessingTime))
+      // Plain entity key, simple key→value dataset, current time as write timestamp.
+      // _PUSH tables have no sort key, so each write overwrites the previous value.
+      out.collect(new AvroCodecOutput(entityKeyBytes, value.tileBytes, dataset,
+        value.latestTsMillis, value.startProcessingTime))
     } catch {
       case e: Exception =>
-        logger.error("Error converting giga tile to PutRequest", e)
+        logger.error("Error converting push tile to PutRequest", e)
         eventProcessingErrorCounter.inc()
         avroConversionErrorCounter.inc()
     }
