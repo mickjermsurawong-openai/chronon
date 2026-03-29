@@ -113,6 +113,10 @@ class MegaTileAggregator(aggregations: Seq[Aggregation],
     windowedAggregator.finalize(resultIr)
   }
 
+  // Expose protected fields from SawtoothAggregator for use by GigaTileStreamProcessor
+  val tailHopIndicesArray: Array[Int] = tailHopIndices
+  val hopSizesArray: Array[Long] = hopSizes
+
   // Like mergeTailHops but skips NO BATCH columns (window <= tailBuffer)
   private[windowing] def mergeTailHopsForBatchColumns(ir: Array[Any],
                                                       queryTs: Long,

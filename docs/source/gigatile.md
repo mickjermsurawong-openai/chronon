@@ -562,32 +562,27 @@ and edge cases for each, showing which code paths fire and what gets emitted.
 
 Building on the existing mega tile infrastructure:
 
-1. **Batch tail cumulation algorithm** (aggregator package, issue #1377 Task 1)
-   - `cumulateTails(FinalBatchIr, SawtoothAggregator) → Array[(Long, Array[Any])]`
-   - Produces cumulated entries indexed by query_ts
-   - Used by GroupByUpload to write cumulated batch to Iceberg
-
-2. **Extend TileStore with batch state**
+1. **Extend TileStore with batch state**
    - Add `getBatchIr/putBatchIr`, `getBatchEndTs/putBatchEndTs`, `getRunningLargeIr/putRunningLargeIr`
    - InMemoryTileStore + FlinkTileStore implementations
 
-3. **Extend MegaTileStreamProcessor → GigaTileStreamProcessor**
+2. **Extend MegaTileStreamProcessor → GigaTileStreamProcessor**
    - Add `onBatchUpdate(newBatchIr, newBatchEnd)` method
    - Modify eviction to recompute `runningLargeIr` from batch hops
    - Emit finalized vectors instead of windowed IRs
 
-4. **Add Iceberg connected stream to Flink job**
+3. **Add Iceberg connected stream to Flink job**
    - `CoProcessFunction` handling both event stream and batch IR stream
    - Periodic Iceberg snapshot monitoring (every 30 min)
 
-5. **Simplify fetcher path**
+4. **Simplify fetcher path**
    - Single point get on entity key
    - Decode finalized vector → return
    - No merge logic needed
 
-6. **Integration test**
+5. **Integration test**
    - Traffic replay: events + batch uploads + queries, time-ordered
    - Compare push-based results with backfilled results via `.diff`
 
-Steps 1-3 are pure aggregator/online changes (testable without Flink/Spark).
-Step 4 is Flink wiring. Steps 5-6 are cleanup and validation.
+Steps 1-2 are pure aggregator/online changes (testable without Flink/Spark).
+Step 3 is Flink wiring. Steps 4-5 are cleanup and validation.
