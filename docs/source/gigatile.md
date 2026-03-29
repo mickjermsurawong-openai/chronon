@@ -500,6 +500,62 @@ T+10 min      All entities fully correct             true
 └──────────────────────────────────────────────┘
 ```
 
+## Entity Scenario Matrix
+
+Each entity falls into one of these categories. The matrix traces through startup, steady state,
+and edge cases for each, showing which code paths fire and what gets emitted.
+
+### Entity types
+
+| Type | Description | Has batch IR? | Has Kafka events? |
+|------|-------------|---------------|-------------------|
+| **A: Active** | In batch table AND streaming topic | Yes | Yes |
+| **B: Inactive** | In batch table, no recent events | Yes | No |
+| **C: New** | Not in batch yet, has streaming events | No | Yes |
+
+### Startup (first deploy or cold restart)
+
+| Entity | Iceberg scan | Kafka replay | First emit | Fully correct at |
+|--------|-------------|-------------|------------|------------------|
+| **A** | batch IR loaded → `currentDayStart` init'd from `batchEnd` → `runningLargeIr` computed → emit batch-only vector | Events replay from `batchEnd` → `onEvent` merges into `runningLargeIr` → emit on each event | On batch IR load (Iceberg) | Watermark caught up (~minutes) |
+| **B** | batch IR loaded → same as A → emit batch-only vector | No events → no Kafka processing | On batch IR load (Iceberg) | Immediately (batch is the full answer) |
+| **C** | No row in Iceberg → no `onBatchUpdate` | Events arrive → `batchIr = null` → `onEvent` emits streaming-only vector | On first Kafka event | Next batch run picks it up |
+
+### Steady state (job running, daily batch refresh)
+
+| Entity | On event | On eviction | On batch refresh |
+|--------|----------|-------------|------------------|
+| **A** | Update tiles + `cachedSmallWindowIr` + `largeTodayIr` + `runningLargeIr` → emit | Rebuild small windows from tiles. Recompute `runningLargeIr` from batch hops + streaming → emit | Store new `batchIr`. Recompute `runningLargeIr`. Emit on mismatch. |
+| **B** | No events → nothing | Timer fires (registered by `onBatchUpdate`). Recompute `runningLargeIr` from batch hops → emit if tail shifted. | Store new `batchIr`. Recompute. Emit on mismatch. |
+| **C** | Same as A but `batchIr = null` → `runningLargeIr` = streaming only → emit | Rebuild small windows. `batchIr = null` → `runningLargeIr` = streaming only → emit | **Transition to type A:** `batchIr` goes null→value. Recompute includes batch. Mismatch → emit. |
+
+### Day transition (advanceWatermark crosses midnight)
+
+| Entity | What happens |
+|--------|-------------|
+| **A** | `largeYesterdayIr = largeTodayIr`, `largeTodayIr = init`, `currentDayStart` advances. `runningLargeIr` NOT reset (cumulative). Eviction corrects tail within one interval. |
+| **B** | `advanceWatermark` fires from global watermark advancement. Same rotation. No events → `largeTodayIr` stays init. Eviction timer recomputes `runningLargeIr` with shifted tail hops. |
+| **C** | Same as A but no batch component. Rotation is streaming-only. |
+
+### Batch refresh (onBatchUpdate) edge cases
+
+| Scenario | Guard | Behavior |
+|----------|-------|----------|
+| `newBatchEnd <= oldBatchEnd` | Early return | Skip (same or older batch) |
+| `currentDayStart < 0` (uninitialized, no events) | Init `currentDayStart = newBatchEnd` | Safe: no events → no overlap. Recompute and emit. |
+| `newBatchEnd > currentDayStart` (watermark lag) | Defer (return) | Store `batchIr` but don't recompute. Next eviction handles it after watermark advances. |
+| `newBatchEnd >= currentDayStart` (normal) | Clear `largeYesterdayIr` | Batch covers through yesterday. Recompute without yesterday. |
+| `newBatchEnd < currentDayStart` (stale batch catch-up) | Keep `largeYesterdayIr` | Batch doesn't cover yesterday. Include yesterday in recomputation. |
+
+### Eviction edge cases
+
+| Scenario | Behavior |
+|----------|----------|
+| `batchIr = null` (new entity, type C) | `runningLargeIr = init + streaming`. No NPE. |
+| `batchIr != null` (types A, B) | `runningLargeIr = clone(collapsed) + mergeTailHops + streaming` |
+| `earliestTileStart = MaxValue` (no tiles, large-windows-only) | Skip tile eviction. Still recompute `runningLargeIr` from batch hops. |
+| Batch-only entity (type B), no `hasSmallWindows` | Timer registered unconditionally by `onBatchUpdate`. Eviction fires at `minEvictionInterval`. |
+
 ## Implementation Path
 
 Building on the existing mega tile infrastructure:
