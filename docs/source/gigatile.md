@@ -162,11 +162,15 @@ def onEviction(timerTs):
 
   // Large windows: recompute running sum from batch + streaming.
   // queryTs advanced → tail hops may have shifted (oldest hop excluded).
-  runningLargeIr = clone(batchIr.collapsed)
-  mergeTailHops(runningLargeIr, queryTs=timerTs, batchEndTs=batchEndTs, batchIr)
+  if batchIr != null:
+    runningLargeIr = clone(batchIr.collapsed)
+    mergeTailHops(runningLargeIr, queryTs=timerTs, batchEndTs=batchEndTs, batchIr)
+  else:
+    // No batch yet (new entity, batch hasn't run). Streaming-only.
+    runningLargeIr = windowedAgg.init
+
   for col where !isNoBatch(col):
     runningLargeIr(col) = merge(runningLargeIr(col), largeTodayIr(col))
-    // Include yesterday if batchEnd < todayStart (batch hasn't caught up)
     if batchEndTs < todayStart:
       runningLargeIr(col) = merge(runningLargeIr(col), largeYesterdayIr(col))
 
@@ -188,17 +192,21 @@ def onBatchUpdate(newBatchIr, newBatchEnd):
   batchIr = newBatchIr
   batchEndTs = newBatchEnd
 
-  // Register eviction timer for batch-only entities (no streaming events to trigger it).
-  if hasSmallWindows:
-    registerEvictionTimer(now + minSmallWindowTileSize)
+  // Register eviction timer unconditionally — needed for:
+  // - batch-only entities (no streaming events to trigger it)
+  // - large-windows-only GroupBys (no small window tiles to drive eviction)
+  registerEvictionTimer(now + minEvictionInterval)
 
   if newBatchEnd > currentDayStart:
-    // Batch is ahead of watermark (race: Iceberg delivered before watermark caught up).
-    // largeTodayIr covers [currentDayStart, now) which overlaps with batch [.., newBatchEnd).
-    // Cannot recompute without double-counting for non-invertible aggregations.
-    // Defer — the next eviction will recompute with correct boundaries after
-    // advanceWatermark moves currentDayStart past newBatchEnd.
-    return
+    if currentDayStart < 0:
+      // Uninitialized (no events yet). Safe to set from batch — largeTodayIr is init,
+      // no overlap concern. Without this, all startup batch loads would defer.
+      currentDayStart = newBatchEnd
+      // fall through to recomputation
+    else:
+      // Real defer: watermark hasn't caught up. largeTodayIr has events that overlap
+      // with batch. Wait for advanceWatermark to rotate, then eviction recomputes.
+      return
 
   // Safe: newBatchEnd <= currentDayStart — no overlap between batch and largeTodayIr.
 
@@ -379,20 +387,18 @@ No suppress logic inside Flink. Flink always emits when it has something to emit
 The serving layer doesn't route traffic until the orchestrator signals "ready."
 
 **Emit triggers:**
-- **Batch IR null→value** (first batch load for an entity): always emit. Covers both
-  initial startup (Iceberg scan) and new entities picked up by a later batch run.
 - **Event arrival**: emit on every event (existing mega tile behavior).
 - **Eviction timer**: emit on periodic eviction (existing).
-- **Batch IR update** (daily refresh): emit only on mismatch (existing).
+- **Batch IR update**: emit if `runningLargeIr` changed. Single rule covers
+  null→value (first batch load), batch correction, tail shift, no-change skip.
 
 ```
 def onBatchUpdate(newBatchIr, newBatchEnd):
+  // ... store batchIr, register timer, defer if overlap (see detailed pseudocode above) ...
+
   oldRunningLargeIr = clone(runningLargeIr)
+  // ... recompute runningLargeIr from batch + hops + streaming ...
 
-  // ... existing logic: store, defer if watermark lag, recompute ...
-
-  // Single rule: emit if the merged answer changed.
-  // Covers null→value (first batch load), batch correction, tail shift, etc.
   if !equal(oldRunningLargeIr, runningLargeIr):
     emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
 ```
