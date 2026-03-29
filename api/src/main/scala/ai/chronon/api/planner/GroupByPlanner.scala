@@ -134,7 +134,7 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
     // PUSH GroupBys write serving info to KV directly from GroupByUpload — skip the
     // KVUploadNodeRunner step (which would bulkPut entity rows that Flink reads from Iceberg).
     val groupByOps = new GroupByOps(groupBy)
-    val kvUploadNodes = if (groupByOps.isGigaTilingEnabled) Seq.empty else Seq(uploadToKVNode)
+    val kvUploadNodes = if (groupByOps.isPushEnabled) Seq.empty else Seq(uploadToKVNode)
     val allNodes = Seq(backfill, uploadNode) ++ kvUploadNodes ++ sensorNodes ++ streamingNode.toSeq
 
     val deployTerminalNode = streamingNode.map(_.metaData.name)

@@ -386,7 +386,7 @@ object FlinkJob {
 
     val groupByOpsVal = new GroupByOps(flinkJob.groupByServingInfoParsed.groupBy)
     val jobDatastream =
-      if (groupByOpsVal.isGigaTilingEnabled) flinkJob.runGigaTiledGroupByJob(env)
+      if (groupByOpsVal.isPushEnabled) flinkJob.runGigaTiledGroupByJob(env)
       else if (groupByOpsVal.isMegaTilingEnabled) flinkJob.runMegaTiledGroupByJob(env)
       else flinkJob.runTiledGroupByJob(env)
 

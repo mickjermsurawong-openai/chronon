@@ -555,7 +555,7 @@ object Extensions {
     def isMegaTilingEnabled: Boolean =
       groupBy.onlineStrategy == OnlineStrategy.STREAMING_MEGATILES
 
-    def isGigaTilingEnabled: Boolean =
+    def isPushEnabled: Boolean =
       groupBy.onlineStrategy == OnlineStrategy.PUSH
 
     def semanticHash: String = {

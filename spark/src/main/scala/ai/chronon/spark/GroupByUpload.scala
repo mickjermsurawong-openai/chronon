@@ -532,7 +532,7 @@ object GroupByUpload {
     // The KVUploadNodeRunner (bulkPut) is being disabled for PUSH — Flink reads entity
     // batch IRs from Iceberg, not KV. But the serving info metadata must still reach KV
     // so the Flink job and fetcher can discover schemas and batchEndDate.
-    if (new GroupByOps(groupByConf).isGigaTilingEnabled) {
+    if (new GroupByOps(groupByConf).isPushEnabled) {
       apiOpt match {
         case Some(onlineApi) =>
           val kvStore = onlineApi.genKvStore

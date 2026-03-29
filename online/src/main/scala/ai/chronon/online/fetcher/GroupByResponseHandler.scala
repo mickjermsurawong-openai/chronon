@@ -60,7 +60,7 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                                                    System.currentTimeMillis() - batchResponseDecodeStartTime)
         response
 
-      } else if (newServingInfo.groupByOps.isGigaTilingEnabled) { // push-based (giga tile)
+      } else if (newServingInfo.groupByOps.isPushEnabled) { // push-based (giga tile)
 
         // Flink writes finalized feature vectors. Single point get, decode, return.
         val streamingResponses = streamingResponsesOpt.get
