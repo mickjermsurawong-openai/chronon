@@ -5,32 +5,32 @@ import ai.chronon.api.{Constants, DataType, GroupBy, TsUtils}
 import ai.chronon.api.ScalaJavaConversions.IteratorOps
 import ai.chronon.flink.SparkExpressionEval
 import ai.chronon.flink.deser.ProjectedEvent
-import ai.chronon.flink.types.TimestampedTile
+import ai.chronon.flink.types.{BatchIrRow, TimestampedTile}
 import ai.chronon.online.{GigaTileCodec, MegaTileCodec}
 import ai.chronon.online.serde.ArrayRow
 import org.apache.flink.api.common.state.{MapState, MapStateDescriptor, ValueState, ValueStateDescriptor}
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.metrics.Counter
-import org.apache.flink.streaming.api.functions.KeyedProcessFunction
+import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction
 import org.apache.flink.util.Collector
 import org.slf4j.{Logger, LoggerFactory}
 
-import scala.util.{Failure, Success, Try}
+import scala.util.Try
 
-/** Flink KeyedProcessFunction for the GigaTile pipeline.
+/** Flink CoProcessFunction for the GigaTile pipeline.
+  *
+  * Two inputs:
+  *   - Stream 1 (processElement1): Kafka events (ProjectedEvent)
+  *   - Stream 2 (processElement2): Batch IR rows from Iceberg upload table (BatchIrRow)
   *
   * Delegates all aggregation logic to GigaTileStreamProcessor.
   * Emits finalized feature vectors (not windowed IRs) to the KV store.
-  *
-  * For batch IR loading: call loadBatchIr() externally (e.g., from an Iceberg source
-  * via a connected stream or broadcast). Currently handles events only — batch IR
-  * integration requires upgrading to a CoProcessFunction (follow-up PR).
   */
 class GigaTileProcessFunction(
     groupBy: GroupBy,
     inputSchema: Seq[(String, DataType)],
     enableDebug: Boolean = false
-) extends KeyedProcessFunction[java.util.List[Any], ProjectedEvent, TimestampedTile] {
+) extends KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile] {
 
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
@@ -40,20 +40,19 @@ class GigaTileProcessFunction(
   @transient private var flinkStore: FlinkGigaTileStore = _
 
   @transient private var eventProcessingErrorCounter: Counter = _
+  @transient private var batchUpdateCounter: Counter = _
   @transient private var lastKey: java.util.List[Any] = _
 
   private val valueColumns: Array[String] = inputSchema.map(_._1).toArray
   private val timeColumnAlias: String = Constants.TimeColumn
 
-  // Flink managed state (mega tile state)
+  // Flink managed state
   private var tileState: MapState[String, Array[Byte]] = _
   private var megaTileIrState: ValueState[Array[Byte]] = _
   private var largeTodayIrState: ValueState[Array[Byte]] = _
   private var largeYesterdayIrState: ValueState[Array[Byte]] = _
   private var currentDayStartState: ValueState[java.lang.Long] = _
   private var earliestTileStartState: ValueState[java.lang.Long] = _
-
-  // Giga tile additional state
   private var batchIrState: ValueState[Array[Byte]] = _
   private var batchEndTsState: ValueState[java.lang.Long] = _
   private var runningLargeIrState: ValueState[Array[Byte]] = _
@@ -65,6 +64,7 @@ class GigaTileProcessFunction(
       .addGroup("chronon")
       .addGroup("feature_group", groupBy.getMetaData.getName)
     eventProcessingErrorCounter = metricsGroup.counter("event_processing_error")
+    batchUpdateCounter = metricsGroup.counter("batch_update_count")
 
     tileState = getRuntimeContext.getMapState(
       new MapStateDescriptor[String, Array[Byte]]("giga-tile-tiles", classOf[String], classOf[Array[Byte]]))
@@ -78,7 +78,6 @@ class GigaTileProcessFunction(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-day-start", classOf[java.lang.Long]))
     earliestTileStartState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-earliest-tile", classOf[java.lang.Long]))
-
     batchIrState =
       getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("giga-tile-batch-ir", classOf[Array[Byte]]))
     batchEndTsState = getRuntimeContext.getState(
@@ -96,7 +95,6 @@ class GigaTileProcessFunction(
     megaTileCodec = new MegaTileCodec(groupBy, inputCols)
     flinkStore = new FlinkGigaTileStore(megaTileAgg, megaTileCodec, gigaTileCodec)
 
-    // Mismatch check: serialize-and-compare-bytes
     val irEqual: (Array[Any], Array[Any]) => Boolean = { (a, b) =>
       java.util.Arrays.equals(gigaTileCodec.encodeWindowedIr(a), gigaTileCodec.encodeWindowedIr(b))
     }
@@ -104,9 +102,21 @@ class GigaTileProcessFunction(
     processor = new GigaTileStreamProcessor(megaTileAgg, flinkStore, irEqual)
   }
 
-  override def processElement(
+  private def ensureStateBound(currentKey: java.util.List[Any]): Unit = {
+    if (lastKey == null || !lastKey.equals(currentKey)) {
+      lastKey = currentKey
+      flinkStore.bindFlinkState(
+        tileState, megaTileIrState, largeTodayIrState, largeYesterdayIrState,
+        currentDayStartState, earliestTileStartState,
+        batchIrState, batchEndTsState, runningLargeIrState
+      )
+    }
+  }
+
+  /** Process a Kafka event (stream 1). */
+  override def processElement1(
       event: ProjectedEvent,
-      ctx: KeyedProcessFunction[java.util.List[Any], ProjectedEvent, TimestampedTile]#Context,
+      ctx: KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#Context,
       out: Collector[TimestampedTile]
   ): Unit = {
     try {
@@ -118,22 +128,7 @@ class GigaTileProcessFunction(
       val values: Array[Any] = valueColumns.map(element(_))
       val row = new ArrayRow(values, tsMills)
 
-      val currentKey = ctx.getCurrentKey
-      if (lastKey == null || !lastKey.equals(currentKey)) {
-        lastKey = currentKey
-        flinkStore.bindFlinkState(
-          tileState,
-          megaTileIrState,
-          largeTodayIrState,
-          largeYesterdayIrState,
-          currentDayStartState,
-          earliestTileStartState,
-          batchIrState,
-          batchEndTsState,
-          runningLargeIrState
-        )
-      }
-
+      ensureStateBound(ctx.getCurrentKey)
       processor.advanceWatermark(ctx.timerService().currentWatermark())
       val result = processor.onEvent(row, tsMills)
 
@@ -145,7 +140,6 @@ class GigaTileProcessFunction(
                               event.startProcessingTimeMillis))
       }
 
-      // Register eviction timer
       val nextEviction = TsUtils.round(tsMills, processor.minEvictionInterval) + processor.minEvictionInterval
       ctx.timerService().registerEventTimeTimer(nextEviction)
     } catch {
@@ -155,30 +149,53 @@ class GigaTileProcessFunction(
     }
   }
 
-  override def onTimer(
-      timestamp: Long,
-      ctx: KeyedProcessFunction[java.util.List[Any], ProjectedEvent, TimestampedTile]#OnTimerContext,
+  /** Process a batch IR row from Iceberg (stream 2). */
+  override def processElement2(
+      batchRow: BatchIrRow,
+      ctx: KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#Context,
       out: Collector[TimestampedTile]
   ): Unit = {
     try {
       if (processor == null) initializeTransients()
 
-      val currentKey = ctx.getCurrentKey
-      if (lastKey == null || !lastKey.equals(currentKey)) {
-        lastKey = currentKey
-        flinkStore.bindFlinkState(
-          tileState,
-          megaTileIrState,
-          largeTodayIrState,
-          largeYesterdayIrState,
-          currentDayStartState,
-          earliestTileStartState,
-          batchIrState,
-          batchEndTsState,
-          runningLargeIrState
-        )
+      ensureStateBound(ctx.getCurrentKey)
+      processor.advanceWatermark(ctx.timerService().currentWatermark())
+
+      val batchIr = gigaTileCodec.decodeBatchIr(batchRow.valueBytes)
+      val result = processor.onBatchUpdate(batchIr, batchRow.batchEndTs,
+        ctx.timerService().currentWatermark())
+
+      batchUpdateCounter.inc()
+
+      if (result.finalizedVector != null) {
+        out.collect(
+          new TimestampedTile(ctx.getCurrentKey,
+                              gigaTileCodec.encodeOutput(result.finalizedVector),
+                              batchRow.batchEndTs,
+                              System.currentTimeMillis()))
       }
 
+      if (result.needsEvictionTimer) {
+        val nextEviction = TsUtils.round(ctx.timerService().currentWatermark(),
+          processor.minEvictionInterval) + processor.minEvictionInterval
+        ctx.timerService().registerEventTimeTimer(nextEviction)
+      }
+    } catch {
+      case e: Exception =>
+        logger.error(s"Error processing batch IR for groupBy=${groupBy.getMetaData.getName}", e)
+        eventProcessingErrorCounter.inc()
+    }
+  }
+
+  override def onTimer(
+      timestamp: Long,
+      ctx: KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#OnTimerContext,
+      out: Collector[TimestampedTile]
+  ): Unit = {
+    try {
+      if (processor == null) initializeTransients()
+
+      ensureStateBound(ctx.getCurrentKey)
       processor.advanceWatermark(ctx.timerService().currentWatermark())
       val result = processor.onEviction(timestamp)
 
@@ -190,7 +207,6 @@ class GigaTileProcessFunction(
                               System.currentTimeMillis()))
       }
 
-      // Re-register eviction timer
       ctx.timerService().registerEventTimeTimer(timestamp + processor.minEvictionInterval)
     } catch {
       case e: Exception =>
@@ -245,7 +261,6 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
     batchIrState = batchIr
     batchEndTsState = batchEndTs
     runningLargeIrState = runningLarge
-    // Invalidate all caches
     cachedSmallValid = false
     largeTodayValid = false
     largeYesterdayValid = false
@@ -315,8 +330,6 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
   override def getEarliestTileStart: Long =
     Option(earliestTileStartState.value()).map(_.longValue()).getOrElse(Long.MaxValue)
   override def putEarliestTileStart(ts: Long): Unit = earliestTileStartState.update(ts)
-
-  // --- GigaTileStore batch state ---
 
   override def getBatchIr: FinalBatchIr = {
     if (!batchIrValid) {

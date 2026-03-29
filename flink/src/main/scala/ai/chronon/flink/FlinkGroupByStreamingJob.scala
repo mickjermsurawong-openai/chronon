@@ -5,6 +5,7 @@ import ai.chronon.api.DataType
 import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.FlinkSource
+import ai.chronon.flink.source.BatchIrSourceBuilder
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
 import ai.chronon.online.{GroupByServingInfoParsed, TopicInfo}
 import org.apache.flink.streaming.api.datastream.DataStream
@@ -132,7 +133,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
   override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = {
     logger.info(f"Running Giga Tiled (push) Flink job for groupByName=${groupByName}, Topic=${topic}.")
     val preparedStream = buildSourceStream(env)
-    buildGigaTiledTail(preparedStream, inputSchema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+    val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
+    buildGigaTiledTail(preparedStream, batchIrStream, inputSchema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
   }
 
   private def buildSourceStream(env: StreamExecutionEnvironment): DataStream[ProjectedEvent] = {

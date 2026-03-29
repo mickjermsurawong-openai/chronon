@@ -60,7 +60,27 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
                                                    System.currentTimeMillis() - batchResponseDecodeStartTime)
         response
 
-      } else { // temporal accurate
+      } else if (newServingInfo.groupByOps.isGigaTilingEnabled) { // push-based (giga tile)
+
+        // Flink writes finalized feature vectors. Single point get, decode, return.
+        val streamingResponses = streamingResponsesOpt.get
+        if (streamingResponses.nonEmpty) {
+          val latest = streamingResponses.maxBy(_.millis)
+          newServingInfo.outputCodec.decodeMap(latest.bytes)
+        } else {
+          // No streaming data yet. Fall back to batch-only if available.
+          val batchResponseDecodeStartTime = System.currentTimeMillis()
+          val response = getMapResponseFromBatchResponse(batchResponses,
+                                                          batchBytes,
+                                                          newServingInfo.outputCodec.decodeMap,
+                                                          newServingInfo,
+                                                          requestContext.keys)
+          requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
+                                                      System.currentTimeMillis() - batchResponseDecodeStartTime)
+          response
+        }
+
+      } else { // temporal accurate (mega tile or standard tiling)
 
         val updatedContext = requestContext.copy(servingInfo = newServingInfo)
         val streamingResponses = streamingResponsesOpt.get

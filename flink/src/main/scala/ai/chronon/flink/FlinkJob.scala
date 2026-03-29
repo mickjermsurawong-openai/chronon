@@ -9,7 +9,7 @@ import ai.chronon.flink.{AsyncKVStoreWriter, FlinkGroupByStreamingJob}
 import ai.chronon.flink.deser.{DeserializationSchemaBuilder, FlinkSerDeProvider, ProjectedEvent, SourceProjection}
 import ai.chronon.flink.chaining.ChainedGroupByJob
 import ai.chronon.flink.source.FlinkSourceProvider
-import ai.chronon.flink.types.{AvroCodecOutput, TimestampedTile, WriteResponse}
+import ai.chronon.flink.types.{AvroCodecOutput, BatchIrRow, TimestampedTile, WriteResponse}
 import ai.chronon.flink.validation.ValidationFlinkJob
 import ai.chronon.flink.window.{
   AlwaysFireOnElementTrigger,
@@ -159,19 +159,29 @@ abstract class BaseFlinkJob {
     AsyncKVStoreWriter.withUnorderedWaits(putRecordDS, sinkFn, groupByName, capacity = kvStoreCapacity)
   }
 
-  /** Shared tail for giga tiled pipeline: keyBy → GigaTileProcessFunction → giga tile codec → KV write.
+  /** Shared tail for giga tiled pipeline: connect event + batch streams → GigaTileProcessFunction → codec → KV write.
     * Emits finalized feature vectors with plain entity keys.
+    *
+    * @param batchIrStream batch IR rows from Iceberg upload table (keyed by entity).
+    *                      Use an idle/empty stream if Iceberg source is not yet configured.
     */
   protected def buildGigaTiledTail(
       preparedStream: DataStream[ProjectedEvent],
+      batchIrStream: DataStream[BatchIrRow],
       schema: Seq[(String, DataType)],
       parallelism: Int,
       sinkFn: RichAsyncFunction[AvroCodecOutput, WriteResponse],
       kvStoreCapacity: Int,
       enableDebug: Boolean
   ): DataStream[WriteResponse] = {
+    val eventKeySelector = KeySelectorBuilder.build(groupByServingInfoParsed.groupBy)
+    val batchKeySelector = new org.apache.flink.api.java.functions.KeySelector[BatchIrRow, java.util.List[Any]] {
+      override def getKey(row: BatchIrRow): java.util.List[Any] = row.entityKeys
+    }
+
     val gigaTileDS = preparedStream
-      .keyBy(KeySelectorBuilder.build(groupByServingInfoParsed.groupBy))
+      .connect(batchIrStream)
+      .keyBy(eventKeySelector, batchKeySelector)
       .process(new GigaTileProcessFunction(groupByServingInfoParsed.groupBy, schema, enableDebug))
       .uid(s"giga-tiling-$groupByName")
       .name(s"Giga Tiling for $groupByName")

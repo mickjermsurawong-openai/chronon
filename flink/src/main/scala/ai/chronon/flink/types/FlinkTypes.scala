@@ -146,3 +146,30 @@ class WriteResponse(var keyBytes: Array[Byte],
       case _ => false
     }
 }
+
+/** Batch IR row from the Iceberg upload table.
+  * Carries decoded entity keys and raw value bytes for a single entity's batch IR.
+  * Used as the second input to GigaTileProcessFunction (CoProcessFunction).
+  */
+class BatchIrRow(var entityKeys: util.List[Any],
+                 var valueBytes: Array[Byte],
+                 var batchEndTs: Long) {
+  def this() = this(new util.ArrayList[Any](), Array(), 0L)
+
+  override def hashCode(): Int =
+    Objects.hash(
+      util.Arrays.deepToString(entityKeys.toArray.asInstanceOf[Array[AnyRef]]),
+      valueBytes,
+      batchEndTs.asInstanceOf[java.lang.Long]
+    )
+
+  override def equals(other: Any): Boolean =
+    other match {
+      case o: BatchIrRow =>
+        util.Arrays.deepEquals(entityKeys.toArray.asInstanceOf[Array[AnyRef]],
+                               o.entityKeys.toArray.asInstanceOf[Array[AnyRef]]) &&
+        util.Arrays.equals(valueBytes, o.valueBytes) &&
+        batchEndTs == o.batchEndTs
+      case _ => false
+    }
+}

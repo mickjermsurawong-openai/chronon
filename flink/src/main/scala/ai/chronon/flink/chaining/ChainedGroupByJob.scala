@@ -6,7 +6,7 @@ import ai.chronon.api._
 import ai.chronon.flink.{AsyncKVStoreWriter, BaseFlinkJob, FlinkUtils}
 import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
-import ai.chronon.flink.source.FlinkSource
+import ai.chronon.flink.source.{BatchIrSourceBuilder, FlinkSource}
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
 import ai.chronon.online.{Api, GroupByServingInfoParsed, TopicInfo}
 
@@ -97,7 +97,8 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
       s"Building giga tiled (push) Flink streaming job for groupBy: $groupByName that chains join: " +
         s"${joinSource.getJoin.getMetaData.getName} using topic: $topic")
     val (processedStream, schema) = buildEnrichedStream(env)
-    buildGigaTiledTail(processedStream, schema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+    val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
+    buildGigaTiledTail(processedStream, batchIrStream, schema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
   }
 
   /** Build the source → watermark → enrichment → query transform pipeline.

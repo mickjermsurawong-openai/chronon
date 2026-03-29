@@ -13,6 +13,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
   def moduleDeps = Seq(build.aggregator(crossValue), build.api(crossValue), build.online(crossValue))
 
   def compileMvnDeps = build.Constants.providedFlinkDeps ++ Seq(
+    mvn"org.apache.flink:flink-table-common:${build.Constants.flinkVersion}",
     mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}",
     mvn"org.apache.spark::spark-sql:${build.Constants.sparkVersion}",
   )
@@ -33,6 +34,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
     mvn"com.google.protobuf:protobuf-java-util:${build.Constants.protobufVersion}",
     mvn"com.google.protobuf:protobuf-java:${build.Constants.protobufVersion}",
     mvn"org.apache.flink:flink-connector-kafka:3.0.2-1.18",
+    mvn"org.apache.iceberg:iceberg-flink-runtime-1.17:1.6.1",
     mvn"io.netty:netty-codec-http2:4.1.129.Final",
   )
 
