@@ -89,10 +89,15 @@ class KVUploadNodeRunner(api: Api) extends NodeRunner {
     }
 
     val startTime = System.currentTimeMillis()
+
     logger.info(s"Starting KV upload for GroupBy: $groupByName, partition: $partitionString, table: $offlineTable")
 
     try {
       val kvStore = api.genKvStore
+      // For PUSH GroupBys, entity rows are redundant (Flink reads from Iceberg),
+      // but bulkPut also transfers the GroupByServingInfo metadata row which is
+      // needed by the Flink job and fetcher. Skipping entity rows requires
+      // row-level filtering in bulkPut — deferred to a follow-up.
       kvStore.bulkPut(offlineTable, groupByName, partitionString)
 
       val duration = (System.currentTimeMillis() - startTime) / 1000
