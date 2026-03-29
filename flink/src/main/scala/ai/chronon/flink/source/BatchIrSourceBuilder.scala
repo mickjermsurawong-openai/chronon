@@ -109,7 +109,10 @@ object BatchIrSourceBuilder {
   }
 }
 
-/** Decodes Iceberg RowData (key_bytes, value_bytes, ...) into BatchIrRow. */
+/** Decodes Iceberg RowData (key_bytes, value_bytes, key_json, value_json, ds) into BatchIrRow.
+  * batchEnd is derived from the ds partition column — NOT from the static servingInfo.batchEndTsMillis.
+  * Each new partition (ds=2026-03-29) produces a fresh batchEnd, ensuring onBatchUpdate accepts it.
+  */
 class BatchIrRowDecoder(servingInfo: GroupByServingInfoParsed)
     extends RichFlatMapFunction[RowData, BatchIrRow] {
 
@@ -128,15 +131,32 @@ class BatchIrRowDecoder(servingInfo: GroupByServingInfoParsed)
     }
   }
 
+  @transient private lazy val dsParser: String => Long = {
+    val fmt = new java.text.SimpleDateFormat(servingInfo.groupByServingInfo.getDateFormat)
+    fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"))
+    ds: String => fmt.parse(ds).getTime
+  }
+
+  // Upload table columns: key_bytes(0), value_bytes(1), key_json(2), value_json(3), ds(4)
+  private val DsColumnIndex = 4
+
   override def flatMap(row: RowData, out: Collector[BatchIrRow]): Unit = {
     try {
-      // Upload table schema: key_bytes (col 0), value_bytes (col 1)
       val keyBytes = row.getBinary(0)
       val valueBytes = row.getBinary(1)
       if (keyBytes == null || valueBytes == null) return
 
       val entityKeys = keyDecoder(keyBytes)
-      val batchEnd = servingInfo.batchEndTsMillis
+
+      // Derive batchEnd from the ds partition column. Each new upload partition
+      // (e.g., ds=2026-03-29) produces batchEnd = Mar 29 00:00 UTC, which advances
+      // past the previous partition's batchEnd. Without this, onBatchUpdate rejects
+      // all updates after the first as stale (newBatchEnd <= oldBatchEnd).
+      val batchEnd = if (row.getArity > DsColumnIndex && !row.isNullAt(DsColumnIndex)) {
+        dsParser(row.getString(DsColumnIndex).toString)
+      } else {
+        servingInfo.batchEndTsMillis
+      }
 
       out.collect(new BatchIrRow(entityKeys, valueBytes, batchEnd))
     } catch {

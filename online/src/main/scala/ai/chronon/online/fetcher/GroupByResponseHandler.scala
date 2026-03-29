@@ -68,16 +68,11 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
           val latest = streamingResponses.maxBy(_.millis)
           newServingInfo.outputCodec.decodeMap(latest.bytes)
         } else {
-          // No streaming data yet. Fall back to batch-only if available.
-          val batchResponseDecodeStartTime = System.currentTimeMillis()
-          val response = getMapResponseFromBatchResponse(batchResponses,
-                                                          batchBytes,
-                                                          newServingInfo.outputCodec.decodeMap,
-                                                          newServingInfo,
-                                                          requestContext.keys)
-          requestContext.metricsContext.distribution("group_by.batchir_decode.latency.millis",
-                                                      System.currentTimeMillis() - batchResponseDecodeStartTime)
-          response
+          // No streaming data yet (Flink hasn't emitted for this entity).
+          // Batch KV contains IR-schema bytes, not output-schema — can't decode here.
+          // Return nulls; Flink will emit a batch-only vector once Iceberg scan completes.
+          requestContext.metricsContext.increment("group_by.push.no_streaming_data")
+          newServingInfo.outputCodec.fieldNames.map(_ -> null).toMap
         }
 
       } else { // temporal accurate (mega tile or standard tiling)

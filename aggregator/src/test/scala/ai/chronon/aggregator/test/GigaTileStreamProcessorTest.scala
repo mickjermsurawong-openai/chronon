@@ -436,4 +436,104 @@ class GigaTileStreamProcessorTest extends AnyFlatSpec {
       fail(s"giga_batch_refresh: mismatch\n  expected: $expStr\n  got:      $actStr")
     }
   }
+
+  it should "accept sequential batch updates with advancing batchEnd (Bug 1 regression)" in {
+    val (events, schema) = generateEvents(14, 20000)
+    val maxTs = events.map(_.ts).max
+    val day1End = TsUtils.round(maxTs - 3 * DayMillis, DayMillis)
+    val day2End = day1End + DayMillis
+    val day3End = day2End + DayMillis
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", AllWindows),
+      Builders.Aggregation(Operation.COUNT, "num", AllWindows)
+    )
+
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+
+    // Day 1 batch — initializes currentDayStart = day1End
+    val batch1 = denormalizeBatchIr(buildBatchIr(events, day1End, aggregations, schema), aggregations, schema, day1End)
+    val result1 = processor.onBatchUpdate(batch1, day1End, day1End)
+    assertNotNull("first batch should emit", result1.finalizedVector)
+    assertEquals("store should track day1 batchEnd", day1End, store.getBatchEndTs)
+
+    // Advance watermark past day2End so currentDayStart catches up (avoids defer)
+    processor.advanceWatermark(day2End + 6 * 3600 * 1000L)
+
+    // Day 2 batch — batchEnd advances, must NOT be rejected as stale
+    val batch2 = denormalizeBatchIr(buildBatchIr(events, day2End, aggregations, schema), aggregations, schema, day2End)
+    val result2 = processor.onBatchUpdate(batch2, day2End, day2End)
+    assertNotNull("second batch should emit (not rejected as stale)", result2.finalizedVector)
+    assertEquals("store should track day2 batchEnd", day2End, store.getBatchEndTs)
+
+    // Advance watermark past day3End
+    processor.advanceWatermark(day3End + 6 * 3600 * 1000L)
+
+    // Day 3 batch
+    val batch3 = denormalizeBatchIr(buildBatchIr(events, day3End, aggregations, schema), aggregations, schema, day3End)
+    val result3 = processor.onBatchUpdate(batch3, day3End, day3End)
+    assertNotNull("third batch should emit", result3.finalizedVector)
+    assertEquals("store should track day3 batchEnd", day3End, store.getBatchEndTs)
+  }
+
+  it should "suppress redundant eviction emits when nothing changed (Bug 2 regression)" in {
+    val (events, schema) = generateEvents(14, 10000)
+    val maxTs = events.map(_.ts).max
+    val batchEnd = TsUtils.round(maxTs - DayMillis, DayMillis)
+
+    // Large windows only — no small windows, no tile rebuilding.
+    // This ensures eviction only recomputes runningLargeIr from batch hops.
+    // With 1hr hops, two evictions 5 min apart produce the same tail hop selection.
+    val largeWindows = Seq(
+      new Window(49, TimeUnit.HOURS),
+      new Window(3, TimeUnit.DAYS),
+      new Window(7, TimeUnit.DAYS)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", largeWindows),
+      Builders.Aggregation(Operation.COUNT, "num", largeWindows)
+    )
+
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    // irEqual that actually compares values
+    val irEqual: (Array[Any], Array[Any]) => Boolean = { (a, b) =>
+      if (a == null && b == null) true
+      else if (a == null || b == null) false
+      else a.length == b.length && a.zip(b).forall {
+        case (null, null) => true
+        case (null, _) | (_, null) => false
+        case (x, y) => x == y
+      }
+    }
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store, irEqual)
+
+    assertFalse("should have no small windows", processor.hasSmallWindows)
+
+    // Load batch
+    val batchIr = denormalizeBatchIr(buildBatchIr(events, batchEnd, aggregations, schema), aggregations, schema, batchEnd)
+    processor.onBatchUpdate(batchIr, batchEnd, batchEnd)
+
+    // Process some events
+    val streamEvents = events.filter(e => e.ts >= batchEnd && e.ts < batchEnd + 12 * 3600 * 1000L).sortBy(_.ts)
+    for (event <- streamEvents) {
+      processor.advanceWatermark(event.ts)
+      processor.onEvent(event, event.ts)
+    }
+
+    // First eviction at an hour boundary — should emit
+    val evictionTs = TsUtils.round(batchEnd + 12 * 3600 * 1000L, 3600 * 1000L)
+    processor.advanceWatermark(evictionTs)
+    val result1 = processor.onEviction(evictionTs)
+    assertNotNull("first eviction should emit", result1.finalizedVector)
+
+    // Second eviction 5 min later — same hour boundary, no events, nothing changed
+    val nextEviction = evictionTs + 5 * 60 * 1000L
+    processor.advanceWatermark(nextEviction)
+    val result2 = processor.onEviction(nextEviction)
+    assertNull("redundant eviction should not emit when nothing changed", result2.finalizedVector)
+  }
 }

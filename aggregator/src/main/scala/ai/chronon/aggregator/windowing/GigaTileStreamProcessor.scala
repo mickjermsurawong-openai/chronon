@@ -49,6 +49,10 @@ class GigaTileStreamProcessor(
   // Large-window-only GroupBys need eviction for tail hop correction.
   val minEvictionInterval: Long = megaTileAgg.activeTiers.min
 
+  // Tracks the packed IR from the last eviction emit. Used to suppress redundant KV writes
+  // when nothing changed between evictions (idle entities, no tail hop shift).
+  private var lastEvictionPackedIr: Array[Any] = _
+
   // Hop indices only used by small (NO BATCH) windows — stripped from batch IR on load.
   // 5-min tail hops for ≤12h windows are never used by mergeTailHopsForBatchColumns.
   private[windowing] val smallWindowOnlyHopIndices: Set[Int] = {
@@ -201,7 +205,15 @@ class GigaTileStreamProcessor(
     // --- Large windows: recompute runningLargeIr from batch + streaming ---
     recomputeRunningLargeIr(timerTs, currentDayStart)
 
-    GigaEmitResult(packAndFinalize())
+    // Suppress redundant emits: skip if the packed IR hasn't changed since last eviction.
+    // For idle entities with no events and no tail hop shift, this avoids O(entities) KV writes per interval.
+    val packed = pack()
+    if (lastEvictionPackedIr != null && irEqual(lastEvictionPackedIr, packed)) {
+      GigaEmitResult(null)
+    } else {
+      lastEvictionPackedIr = windowedAgg.clone(packed)
+      GigaEmitResult(windowedAgg.finalize(packed))
+    }
   }
 
   /** Process a new batch IR from the Iceberg connected stream.
@@ -295,8 +307,8 @@ class GigaTileStreamProcessor(
     }
   }
 
-  /** Pack small + large window columns into a single IR and finalize to output values. */
-  private[windowing] def packAndFinalize(): Array[Any] = {
+  /** Pack small + large window columns into a single windowed IR (before finalization). */
+  private def pack(): Array[Any] = {
     val cachedIr = store.getCachedSmallWindowIr
     val runningIr = store.getRunningLargeIr
     val packed = new Array[Any](windowedAgg.length)
@@ -305,8 +317,11 @@ class GigaTileStreamProcessor(
       packed(col) = if (isNoBatch(col)) cachedIr(col) else runningIr(col)
       col += 1
     }
-    windowedAgg.finalize(packed)
+    packed
   }
+
+  /** Pack small + large window columns and finalize to output values. */
+  private[windowing] def packAndFinalize(): Array[Any] = windowedAgg.finalize(pack())
 
   /** Strip tail hops that are only used by small windows to reduce state size.
     * 5-min hops for ≤12h windows are never consumed by mergeTailHopsForBatchColumns.
