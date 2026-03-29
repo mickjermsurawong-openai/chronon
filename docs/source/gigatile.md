@@ -195,10 +195,8 @@ def onBatchUpdate(newBatchIr, newBatchEnd):
   // Register eviction timer unconditionally — needed for:
   // - batch-only entities (no streaming events to trigger it)
   // - large-windows-only GroupBys (no small window tiles to drive eviction)
-  // minEvictionInterval = min(activeTiers) across ALL windows (small + large).
-  // For small-windows-only: 5min or 1hr (from small window hop sizes).
-  // For large-windows-only: 1hr (from large window hop size, not DayMillis).
-  // This ensures tail hop corrections fire at hop granularity.
+  // minEvictionInterval = min(activeTiers) — the smallest hop size across ALL windows.
+  // Matches hop granularity so tail hop corrections fire at the right cadence.
   registerEvictionTimer(now + minEvictionInterval)
 
   if newBatchEnd > currentDayStart:
