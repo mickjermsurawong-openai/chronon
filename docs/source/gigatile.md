@@ -272,11 +272,47 @@ The emitted value is a **finalized feature vector** — the same format that the
 return to the ML model. No further processing needed.
 
 ```
-KV key:   entityKeyBytes (plain entity key, no TileKey wrapper, no day suffix)
-KV value: finalized feature vector (Avro encoded output schema)
+KV dataset: {GROUP_BY_NAME}_PUSH  (not _STREAMING)
+KV key:     entityKeyBytes (plain entity key, no TileKey wrapper, no day suffix)
+KV value:   finalized feature vector (Avro encoded output schema)
 ```
 
 Single entry per entity. Overwritten on every emit. The fetcher reads one key, decodes, returns.
+
+### Why a dedicated `_PUSH` dataset
+
+Push writes use simple key→value semantics (one value per entity, overwritten on every emit).
+The existing `_STREAMING` dataset has **time-series semantics** baked into all KV implementations:
+
+| Implementation | `_STREAMING` behavior | Problem for push |
+|---|---|---|
+| DynamoDB | Composite key (partition + sort key = timestamp) | `GetItem` on plain entity key fails — sort key not specified |
+| BigTable | Day-based row key generation for time-series reads | Won't find rows written with plain entity keys |
+| Redis | Sorted sets (`zadd`/`zrangebyscore`) | Each timestamp creates a new member — unbounded growth |
+
+The `_PUSH` dataset avoids all of this:
+
+| Implementation | `_PUSH` behavior | Why it works |
+|---|---|---|
+| DynamoDB | Partition key only (no sort key) | `PutItem` overwrites; `GetItem` returns single value |
+| BigTable | Non-time-series; `cellsPerRow(1)` GC | `setCell` overwrites; read returns latest cell |
+| Redis | Simple `setex`/`get` | Overwrites on every write; single value per key |
+| Cosmos | Batch-style `upsertItem` by key hash | Document ID has no timestamp; upsert overwrites |
+
+The `_PUSH` suffix is chosen intentionally: DynamoDB's `isStreamingTable` check (`dataset.endsWith("_STREAMING")`)
+determines whether to add a sort key. `_PUSH` doesn't match, so the table is created as a simple key-value store.
+
+### Planner and upload changes
+
+For `OnlineStrategy.PUSH` GroupBys:
+
+- **Planner**: The `uploadToKVNode` is excluded from the plan — `KVUploadNodeRunner` (bulkPut of entity
+  rows) is not scheduled. Flink reads entity batch IRs directly from the Iceberg upload table.
+- **GroupByUpload**: Writes `GroupByServingInfo` directly to KV via `kvStore.put()` at the end of the
+  upload job. This replaces the `KVUploadNodeRunner` path for the metadata row. The serving info is
+  already in memory from `buildServingInfo()` — no extra table read needed.
+- **Upload table**: Still receives both entity rows and the serving info row (unchanged). Flink's Iceberg
+  source reads entity rows from here.
 
 ## Scenario Tables
 
