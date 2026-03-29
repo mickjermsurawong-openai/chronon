@@ -131,9 +131,14 @@ case class GroupByPlanner(groupBy: GroupBy)(implicit outputPartitionSpec: Partit
       .map { es =>
         toNode(es.metaData, _.setExternalSourceSensor(es), ExternalSourceSensorUtil.semanticExternalSourceSensor(es))
       }
-    val allNodes = Seq(backfill, uploadNode, uploadToKVNode) ++ sensorNodes ++ streamingNode.toSeq
+    // PUSH GroupBys write serving info to KV directly from GroupByUpload — skip the
+    // KVUploadNodeRunner step (which would bulkPut entity rows that Flink reads from Iceberg).
+    val groupByOps = new GroupByOps(groupBy)
+    val kvUploadNodes = if (groupByOps.isGigaTilingEnabled) Seq.empty else Seq(uploadToKVNode)
+    val allNodes = Seq(backfill, uploadNode) ++ kvUploadNodes ++ sensorNodes ++ streamingNode.toSeq
 
-    val deployTerminalNode = streamingNode.map(_.metaData.name).getOrElse(uploadToKVNode.metaData.name)
+    val deployTerminalNode = streamingNode.map(_.metaData.name)
+      .getOrElse(if (kvUploadNodes.nonEmpty) uploadToKVNode.metaData.name else uploadNode.metaData.name)
 
     val terminalNodeNames = Map(
       ai.chronon.planner.Mode.BACKFILL -> backfill.metaData.name,
