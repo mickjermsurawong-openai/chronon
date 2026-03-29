@@ -148,12 +148,13 @@ class BatchIrRowDecoder(servingInfo: GroupByServingInfoParsed)
 
       val entityKeys = keyDecoder(keyBytes)
 
-      // Derive batchEnd from the ds partition column. Each new upload partition
-      // (e.g., ds=2026-03-29) produces batchEnd = Mar 29 00:00 UTC, which advances
-      // past the previous partition's batchEnd. Without this, onBatchUpdate rejects
-      // all updates after the first as stale (newBatchEnd <= oldBatchEnd).
+      // Derive batchEnd from the ds partition column. Chronon convention:
+      // batchEnd = after(ds) = ds + 1 day. Batch for ds=2026-03-28 covers
+      // [Mar 28 00:00, Mar 29 00:00), so batchEnd = Mar 29 00:00.
+      // See GroupByUpload: batchEndDate = partitionSpec.after(endDs).
+      val DayMillis = 24 * 3600 * 1000L
       val batchEnd = if (row.getArity > DsColumnIndex && !row.isNullAt(DsColumnIndex)) {
-        dsParser(row.getString(DsColumnIndex).toString)
+        dsParser(row.getString(DsColumnIndex).toString) + DayMillis
       } else {
         servingInfo.batchEndTsMillis
       }
