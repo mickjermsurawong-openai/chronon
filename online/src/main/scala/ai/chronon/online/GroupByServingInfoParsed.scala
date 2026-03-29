@@ -108,6 +108,12 @@ class GroupByServingInfoParsed(val groupByServingInfo: GroupByServingInfo)
 
   // End mega tiling specific variables
 
+  // Start giga tiling specific variables
+
+  lazy val gigaTileCodec: GigaTileCodec = new GigaTileCodec(groupBy, valueInputSchema)
+
+  // End giga tiling specific variables
+
   def outputChrononSchema: StructType =
     if (groupByServingInfo.groupBy.aggregations == null) {
       selectedChrononSchema

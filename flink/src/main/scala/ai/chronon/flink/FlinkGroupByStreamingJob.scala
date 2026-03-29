@@ -129,6 +129,12 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
     buildMegaTiledTail(preparedStream, inputSchema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
   }
 
+  override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = {
+    logger.info(f"Running Giga Tiled (push) Flink job for groupByName=${groupByName}, Topic=${topic}.")
+    val preparedStream = buildSourceStream(env)
+    buildGigaTiledTail(preparedStream, inputSchema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+  }
+
   private def buildSourceStream(env: StreamExecutionEnvironment): DataStream[ProjectedEvent] = {
     val sourceSparkProjectedStream = eventSrc
       .getDataStream(topic, groupByName)(env, parallelism)

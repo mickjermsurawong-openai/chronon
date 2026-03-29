@@ -555,6 +555,9 @@ object Extensions {
     def isMegaTilingEnabled: Boolean =
       groupBy.onlineStrategy == OnlineStrategy.STREAMING_MEGATILES
 
+    def isGigaTilingEnabled: Boolean =
+      groupBy.onlineStrategy == OnlineStrategy.PUSH
+
     def semanticHash: String = {
       val newGroupBy = groupBy.deepCopy()
       newGroupBy.unsetMetaData()

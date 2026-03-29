@@ -92,6 +92,14 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
     buildMegaTiledTail(processedStream, schema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
   }
 
+  override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = {
+    logger.info(
+      s"Building giga tiled (push) Flink streaming job for groupBy: $groupByName that chains join: " +
+        s"${joinSource.getJoin.getMetaData.getName} using topic: $topic")
+    val (processedStream, schema) = buildEnrichedStream(env)
+    buildGigaTiledTail(processedStream, schema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+  }
+
   /** Build the source → watermark → enrichment → query transform pipeline.
     * Returns the prepared stream and its post-transformation schema.
     */

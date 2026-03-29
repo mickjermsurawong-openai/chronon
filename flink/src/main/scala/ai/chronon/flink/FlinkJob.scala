@@ -16,6 +16,7 @@ import ai.chronon.flink.window.{
   BufferedProcessingTimeTrigger,
   FlinkRowAggProcessFunction,
   FlinkRowAggregationFunction,
+  GigaTileProcessFunction,
   KeySelectorBuilder,
   MegaTileProcessFunction
 }
@@ -63,6 +64,11 @@ abstract class BaseFlinkJob {
     * Default delegates to buildMegaTiledTail. Subclasses must provide source setup.
     */
   def runMegaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse]
+
+  /** Run the streaming job with giga tiling (push-based) enabled.
+    * Emits finalized feature vectors — fetcher does a single point get.
+    */
+  def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse]
 
   /** Shared tail for tiled pipeline: keyBy → window aggregate → tile codec → KV write.
     * Both FlinkGroupByStreamingJob and ChainedGroupByJob use this with their respective
@@ -148,6 +154,33 @@ abstract class BaseFlinkJob {
       .flatMap(MegaTileAvroCodecFn(groupByServingInfoParsed, enableDebug))
       .uid(s"mega-avro-conversion-$groupByName")
       .name(s"Mega Tile Avro conversion for $groupByName")
+      .setParallelism(parallelism)
+
+    AsyncKVStoreWriter.withUnorderedWaits(putRecordDS, sinkFn, groupByName, capacity = kvStoreCapacity)
+  }
+
+  /** Shared tail for giga tiled pipeline: keyBy → GigaTileProcessFunction → giga tile codec → KV write.
+    * Emits finalized feature vectors with plain entity keys.
+    */
+  protected def buildGigaTiledTail(
+      preparedStream: DataStream[ProjectedEvent],
+      schema: Seq[(String, DataType)],
+      parallelism: Int,
+      sinkFn: RichAsyncFunction[AvroCodecOutput, WriteResponse],
+      kvStoreCapacity: Int,
+      enableDebug: Boolean
+  ): DataStream[WriteResponse] = {
+    val gigaTileDS = preparedStream
+      .keyBy(KeySelectorBuilder.build(groupByServingInfoParsed.groupBy))
+      .process(new GigaTileProcessFunction(groupByServingInfoParsed.groupBy, schema, enableDebug))
+      .uid(s"giga-tiling-$groupByName")
+      .name(s"Giga Tiling for $groupByName")
+      .setParallelism(parallelism)
+
+    val putRecordDS = gigaTileDS
+      .flatMap(GigaTileAvroCodecFn(groupByServingInfoParsed, enableDebug))
+      .uid(s"giga-avro-conversion-$groupByName")
+      .name(s"Giga Tile Avro conversion for $groupByName")
       .setParallelism(parallelism)
 
     AsyncKVStoreWriter.withUnorderedWaits(putRecordDS, sinkFn, groupByName, capacity = kvStoreCapacity)
@@ -341,9 +374,10 @@ object FlinkJob {
       FlinkJob.runWriteInternalManifestJob(env, jobArgs.streamingManifestPath(), maybeParentJobId.get, groupByName)
     }
 
-    val isMegaTiling = new GroupByOps(flinkJob.groupByServingInfoParsed.groupBy).isMegaTilingEnabled
+    val groupByOpsVal = new GroupByOps(flinkJob.groupByServingInfoParsed.groupBy)
     val jobDatastream =
-      if (isMegaTiling) flinkJob.runMegaTiledGroupByJob(env)
+      if (groupByOpsVal.isGigaTilingEnabled) flinkJob.runGigaTiledGroupByJob(env)
+      else if (groupByOpsVal.isMegaTilingEnabled) flinkJob.runMegaTiledGroupByJob(env)
       else flinkJob.runTiledGroupByJob(env)
 
     jobDatastream
