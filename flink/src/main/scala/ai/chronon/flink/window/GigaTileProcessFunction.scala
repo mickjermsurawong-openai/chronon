@@ -207,7 +207,9 @@ class GigaTileProcessFunction(
                               System.currentTimeMillis()))
       }
 
-      ctx.timerService().registerEventTimeTimer(timestamp + processor.minEvictionInterval)
+      // Don't re-register from onTimer. Each event in processElement1 registers the next
+      // eviction timer. Without new events, there's nothing to correct (sawtooth doesn't
+      // grow). This also prevents an infinite timer loop at end-of-stream when watermark = MAX.
     } catch {
       case e: Exception =>
         logger.error(s"Error in giga tile eviction for groupBy=${groupBy.getMetaData.getName}", e)
