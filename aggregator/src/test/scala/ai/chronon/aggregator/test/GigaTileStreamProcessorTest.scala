@@ -536,4 +536,397 @@ class GigaTileStreamProcessorTest extends AnyFlatSpec {
     val result2 = processor.onEviction(nextEviction)
     assertNull("redundant eviction should not emit when nothing changed", result2.finalizedVector)
   }
+
+  // ==========================================================================
+  // Targeted edge case tests — steady state focus
+  // ==========================================================================
+
+  private def row(ts: Long, num: Long, amount: Double): TestRow = new TestRow(ts, num, amount)()
+
+  /** Helper: build a processor with batch loaded, return (processor, store). */
+  private def buildProcessor(
+      aggregations: Seq[Aggregation],
+      schema: Seq[(String, DataType)],
+      batchEvents: Array[TestRow],
+      batchEnd: Long
+  ): (GigaTileStreamProcessor, InMemoryGigaTileStore) = {
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val normalizedBatchIr = buildBatchIr(batchEvents, batchEnd, aggregations, schema)
+    val batchIr = denormalizeBatchIr(normalizedBatchIr, aggregations, schema, batchEnd)
+    processor.onBatchUpdate(batchIr, batchEnd, batchEnd)
+    (processor, store)
+  }
+
+  it should "not lose an event at exactly batchEnd timestamp after eviction" in {
+    // Event at exactly midnight = batchEnd. Batch is exclusive [0, batchEnd), so event is NOT in batch.
+    // onEvent clamps it to today (>= nextDayStart branch). After day rotation, it lands in
+    // largeYesterdayIr. Eviction with batchEnd == currentDayStart skips yesterday merge.
+    // The event must still be in the final answer.
+    val batchEnd = 1743033600000L // Mar 27 00:00 UTC (arbitrary fixed point)
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    // Batch events: everything before batchEnd
+    val batchEvents = Array(
+      row(batchEnd - 3 * 3600 * 1000L, 10L, 1.0),
+      row(batchEnd - 6 * 3600 * 1000L, 20L, 2.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", Seq(new Window(3, TimeUnit.DAYS))),
+      Builders.Aggregation(Operation.COUNT, "num", Seq(new Window(3, TimeUnit.DAYS)))
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // Event at exactly batchEnd — this is the edge case
+    val midnightEvent = row(batchEnd, 100L, 5.0)
+    processor.advanceWatermark(batchEnd)
+    val eventResult = processor.onEvent(midnightEvent, batchEnd)
+    assertNotNull("event at batchEnd should emit", eventResult.finalizedVector)
+
+    // Advance watermark past midnight — triggers day rotation
+    processor.advanceWatermark(batchEnd + DayMillis + 60000L)
+
+    // Eviction after rotation
+    val evictResult = processor.onEviction(batchEnd + DayMillis + 60000L)
+    assertNotNull("eviction should emit", evictResult.finalizedVector)
+
+    // The 100 from the midnight event must be present in the 3d SUM
+    // Batch has 10 + 20 = 30. Midnight event adds 100. Total = 130.
+    val naive = naiveAggregate(
+      batchEvents :+ midnightEvent,
+      Array(batchEnd + DayMillis + 60000L),
+      aggregations,
+      schema
+    )
+    if (!approxEqual(evictResult.finalizedVector, naive(0))) {
+      val expStr = gson.toJson(naive(0))
+      val actStr = gson.toJson(evictResult.finalizedVector)
+      fail(s"midnight_event: expected $expStr got $actStr — event at batchEnd likely lost after eviction")
+    }
+  }
+
+  it should "detect incremental vs eviction divergence for late yesterday event after fresh batch" in {
+    // Fresh batch (batchEnd = currentDayStart). A late event from yesterday arrives AFTER
+    // batch was loaded. The event was NOT in the batch source data.
+    // onEvent adds it to largeYesterdayIr + runningLargeIr (incremental).
+    // Eviction recomputes: yesterday not merged (batchEnd >= currentDayStart).
+    // This tests whether the two paths agree.
+    val batchEnd = 1743033600000L // Mar 27 00:00 UTC
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    // Batch events: does NOT include the late event
+    val batchEvents = Array(
+      row(batchEnd - 12 * 3600 * 1000L, 10L, 1.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", Seq(new Window(3, TimeUnit.DAYS)))
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // Advance watermark to today
+    processor.advanceWatermark(batchEnd + 3600 * 1000L)
+
+    // Late event from yesterday — NOT in batch
+    val lateEvent = row(batchEnd - 2 * 3600 * 1000L, 50L, 3.0)
+    val eventResult = processor.onEvent(lateEvent, lateEvent.ts)
+    assertNotNull("late event should emit", eventResult.finalizedVector)
+
+    // Capture incremental value (from onEvent)
+    val incrementalVector = eventResult.finalizedVector.clone()
+
+    // Eviction recomputes from scratch
+    val evictResult = processor.onEviction(batchEnd + 3600 * 1000L)
+    assertNotNull("eviction should emit", evictResult.finalizedVector)
+    val evictionVector = evictResult.finalizedVector
+
+    // Document the divergence: incremental includes the late event, eviction may not.
+    // Both are compared against naive (which DOES include the event).
+    val allEvents = batchEvents :+ lateEvent
+    val naive = naiveAggregate(allEvents, Array(batchEnd + 3600 * 1000L), aggregations, schema)
+
+    val incrementalMatch = approxEqual(incrementalVector, naive(0))
+    val evictionMatch = approxEqual(evictionVector, naive(0))
+
+    // At minimum one of these should match. If neither matches, there's a bug.
+    // The known design trade-off: eviction may drop the late event to avoid double-counting.
+    assertTrue(
+      s"at least one path should match naive. incremental=$incrementalMatch eviction=$evictionMatch",
+      incrementalMatch || evictionMatch
+    )
+
+    // Log which path diverges for visibility
+    if (incrementalMatch && !evictionMatch) {
+      logger.warn("KNOWN TRADE-OFF: eviction drops late yesterday event not in batch " +
+        "(avoids double-count, causes transient value flip)")
+    }
+    if (!incrementalMatch) {
+      fail(s"incremental path should always include the late event: " +
+        s"expected ${gson.toJson(naive(0))} got ${gson.toJson(incrementalVector)}")
+    }
+  }
+
+  it should "not double-count events present in both batch and streaming after eviction" in {
+    // Event at batchEnd - 1hr is in both batch IR and streaming.
+    // Between event and eviction, runningLargeIr double-counts it.
+    // After eviction, it must be counted exactly once.
+    val batchEnd = 1743033600000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    val overlapTs = batchEnd - 3600 * 1000L // 1hr before batchEnd
+    val batchEvents = Array(
+      row(overlapTs, 100L, 5.0),
+      row(batchEnd - 12 * 3600 * 1000L, 10L, 1.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", Seq(new Window(3, TimeUnit.DAYS)))
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+    processor.advanceWatermark(batchEnd + 3600 * 1000L)
+
+    // Replay the overlap event (simulates Kafka delivering it after batch)
+    val overlapEvent = row(overlapTs, 100L, 5.0)
+    processor.onEvent(overlapEvent, overlapEvent.ts)
+
+    // Eviction should correct the double-count
+    val evictResult = processor.onEviction(batchEnd + 3600 * 1000L)
+    assertNotNull("eviction should emit", evictResult.finalizedVector)
+
+    val naive = naiveAggregate(batchEvents, Array(batchEnd + 3600 * 1000L), aggregations, schema)
+    if (!approxEqual(evictResult.finalizedVector, naive(0))) {
+      val expStr = gson.toJson(naive(0))
+      val actStr = gson.toJson(evictResult.finalizedVector)
+      fail(s"double_count: expected $expStr got $actStr — overlap event likely counted twice")
+    }
+  }
+
+  it should "correctly shift tail hops at hourly boundary for large-window-only GroupBy" in {
+    // Large windows only (49h, 3d, 7d) — hourly hops.
+    // Two evictions straddle an hourly boundary: the tail hop selection should change.
+    val batchEnd = 1743033600000L
+    val hourMillis = 3600 * 1000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    // Dense events every hour for 10 days before batchEnd
+    val batchEvents = (0 until 240).map { i =>
+      row(batchEnd - (240 - i) * hourMillis, (i + 1).toLong, 1.0)
+    }.toArray
+
+    val largeWindows = Seq(new Window(49, TimeUnit.HOURS))
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", largeWindows),
+      Builders.Aggregation(Operation.COUNT, "num", largeWindows)
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // No streaming events — batch only entity
+
+    // Eviction just before hourly boundary
+    val queryBefore = batchEnd + 48 * hourMillis + 59 * 60 * 1000L
+    processor.advanceWatermark(queryBefore)
+    val r1 = processor.onEviction(queryBefore)
+    assertNotNull("eviction before hour boundary should emit", r1.finalizedVector)
+
+    // Eviction just after hourly boundary — a different hop enters/exits the 49h window
+    val queryAfter = batchEnd + 49 * hourMillis + 60 * 1000L
+    processor.advanceWatermark(queryAfter)
+    val r2 = processor.onEviction(queryAfter)
+
+    // Verify both match naive
+    val naiveBefore = naiveAggregate(batchEvents, Array(queryBefore), aggregations, schema)
+    val naiveAfter = naiveAggregate(batchEvents, Array(queryAfter), aggregations, schema)
+
+    if (!approxEqual(r1.finalizedVector, naiveBefore(0))) {
+      fail(s"hop_shift: before boundary mismatch: expected ${gson.toJson(naiveBefore(0))} got ${gson.toJson(r1.finalizedVector)}")
+    }
+    if (r2.finalizedVector != null) {
+      if (!approxEqual(r2.finalizedVector, naiveAfter(0))) {
+        fail(s"hop_shift: after boundary mismatch: expected ${gson.toJson(naiveAfter(0))} got ${gson.toJson(r2.finalizedVector)}")
+      }
+    }
+  }
+
+  it should "survive day rotation with no events and produce correct values" in {
+    // Batch loaded, events processed, then entity goes idle across a day boundary.
+    // Verify eviction produces correct results after rotation.
+    val batchEnd = 1743033600000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    val batchEvents = (0 until 100).map { i =>
+      row(batchEnd - (100 - i) * 3600 * 1000L, (i + 1).toLong, 1.0)
+    }.toArray
+
+    // A few streaming events on day 1 only
+    val streamEvents = Array(
+      row(batchEnd + 3600 * 1000L, 200L, 10.0),
+      row(batchEnd + 6 * 3600 * 1000L, 300L, 15.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", AllWindows),
+      Builders.Aggregation(Operation.COUNT, "num", AllWindows)
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // Process streaming events
+    for (event <- streamEvents) {
+      processor.advanceWatermark(event.ts)
+      processor.onEvent(event, event.ts)
+    }
+
+    // Eviction before day boundary
+    val preRotation = batchEnd + 23 * 3600 * 1000L
+    processor.advanceWatermark(preRotation)
+    processor.onEviction(preRotation)
+
+    // Day rotation
+    processor.advanceWatermark(batchEnd + DayMillis + 60000L)
+
+    // Eviction after rotation — no new events
+    val postRotation = batchEnd + DayMillis + 3600 * 1000L
+    processor.advanceWatermark(postRotation)
+    val result = processor.onEviction(postRotation)
+    assertNotNull("post-rotation eviction should emit", result.finalizedVector)
+
+    val allEvents = batchEvents ++ streamEvents
+    val naive = naiveAggregate(allEvents, Array(postRotation), aggregations, schema)
+    if (!approxEqual(result.finalizedVector, naive(0))) {
+      fail(s"day_rotation: expected ${gson.toJson(naive(0))} got ${gson.toJson(result.finalizedVector)}")
+    }
+  }
+
+  it should "handle MIN correctly when min value is at the sawtooth boundary" in {
+    // The global MIN is in the oldest tail hop. As the window slides forward,
+    // that hop should fall off and MIN should increase.
+    val batchEnd = 1743033600000L
+    val hourMillis = 3600 * 1000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    // Place the minimum value exactly at the 3d window's oldest hop boundary
+    val oldHopTs = batchEnd - 71 * hourMillis // ~71 hours before batchEnd
+    val batchEvents = Array(
+      row(oldHopTs, 1L, 1.0), // the min
+      row(batchEnd - 24 * hourMillis, 100L, 10.0),
+      row(batchEnd - 12 * hourMillis, 200L, 20.0),
+      row(batchEnd - 1 * hourMillis, 150L, 15.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.MIN, "num", Seq(new Window(3, TimeUnit.DAYS)))
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // Query while old hop is still in window — MIN should be 1
+    val earlyQuery = batchEnd + 60000L
+    processor.advanceWatermark(earlyQuery)
+    val r1 = processor.onEviction(earlyQuery)
+    val naive1 = naiveAggregate(batchEvents, Array(earlyQuery), aggregations, schema)
+    if (!approxEqual(r1.finalizedVector, naive1(0))) {
+      fail(s"min_boundary early: expected ${gson.toJson(naive1(0))} got ${gson.toJson(r1.finalizedVector)}")
+    }
+
+    // Query after old hop falls off the 3d window — MIN should increase to 100
+    val lateQuery = batchEnd + 2 * hourMillis
+    processor.advanceWatermark(lateQuery)
+    val r2 = processor.onEviction(lateQuery)
+    assertNotNull(r2.finalizedVector)
+    val naive2 = naiveAggregate(batchEvents, Array(lateQuery), aggregations, schema)
+    if (!approxEqual(r2.finalizedVector, naive2(0))) {
+      fail(s"min_boundary late: expected ${gson.toJson(naive2(0))} got ${gson.toJson(r2.finalizedVector)}")
+    }
+  }
+
+  it should "produce identical results from two consecutive emits (finalize must not corrupt IR)" in {
+    val batchEnd = 1743033600000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    val batchEvents = Array(
+      row(batchEnd - 3600 * 1000L, 10L, 1.0),
+      row(batchEnd - 7200 * 1000L, 20L, 2.0)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", AllWindows),
+      Builders.Aggregation(Operation.AVERAGE, "amount", AllWindows),
+      Builders.Aggregation(Operation.FIRST, "num", AllWindows),
+      Builders.Aggregation(Operation.LAST, "num", AllWindows)
+    )
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    processor.advanceWatermark(batchEnd + 3600 * 1000L)
+    processor.onEvent(row(batchEnd + 1000L, 30L, 3.0), batchEnd + 1000L)
+
+    // Two consecutive events — each triggers packAndFinalize. Second must not be corrupted.
+    val r1 = processor.onEvent(row(batchEnd + 2000L, 40L, 4.0), batchEnd + 2000L)
+    val r2 = processor.onEvent(row(batchEnd + 3000L, 0L, 0.0), batchEnd + 3000L)
+    assertNotNull(r1.finalizedVector)
+    assertNotNull(r2.finalizedVector)
+
+    val allEvents = batchEvents ++ Array(
+      row(batchEnd + 1000L, 30L, 3.0), row(batchEnd + 2000L, 40L, 4.0), row(batchEnd + 3000L, 0L, 0.0))
+    val naive2 = naiveAggregate(allEvents, Array(batchEnd + 2000L), aggregations, schema)
+    val naive3 = naiveAggregate(allEvents, Array(batchEnd + 3000L), aggregations, schema)
+
+    if (!approxEqual(r1.finalizedVector, naive2(0))) {
+      fail(s"finalize_corruption: first emit ${gson.toJson(r1.finalizedVector)} != naive ${gson.toJson(naive2(0))}")
+    }
+    if (!approxEqual(r2.finalizedVector, naive3(0))) {
+      fail(s"finalize_corruption: second emit ${gson.toJson(r2.finalizedVector)} != naive ${gson.toJson(naive3(0))}")
+    }
+  }
+
+  it should "handle all-small-window GroupBy with batch loaded correctly" in {
+    // Only small windows (all <= tailBuffer). Large window paths should be no-ops.
+    // Batch IR is loaded but only small window columns matter (from tiles).
+    val batchEnd = 1743033600000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+
+    val smallWindows = Seq(
+      new Window(6, TimeUnit.HOURS),
+      new Window(1, TimeUnit.DAYS),
+      new Window(2, TimeUnit.DAYS)
+    )
+
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM, "num", smallWindows),
+      Builders.Aggregation(Operation.COUNT, "num", smallWindows)
+    )
+
+    val batchEvents = (0 until 200).map { i =>
+      row(batchEnd - (200 - i) * 5 * 60 * 1000L, (i + 1).toLong, 1.0)
+    }.toArray
+
+    val (processor, _) = buildProcessor(aggregations, schema, batchEvents, batchEnd)
+
+    // Streaming events
+    val streamEvents = Array(
+      row(batchEnd + 3600 * 1000L, 500L, 25.0),
+      row(batchEnd + 2 * 3600 * 1000L, 600L, 30.0)
+    )
+    for (event <- streamEvents) {
+      processor.advanceWatermark(event.ts)
+      processor.onEvent(event, event.ts)
+    }
+
+    val queryTs = batchEnd + 3 * 3600 * 1000L
+    processor.advanceWatermark(queryTs)
+    val result = processor.onEviction(queryTs)
+    assertNotNull("all-small-window eviction should emit", result.finalizedVector)
+
+    val allEvents = batchEvents ++ streamEvents
+    val naive = naiveAggregate(allEvents, Array(queryTs), aggregations, schema)
+    if (!approxEqual(result.finalizedVector, naive(0))) {
+      fail(s"all_small_windows: expected ${gson.toJson(naive(0))} got ${gson.toJson(result.finalizedVector)}")
+    }
+  }
 }

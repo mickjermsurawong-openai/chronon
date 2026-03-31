@@ -14,6 +14,12 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
 
   def compileMvnDeps = build.Constants.providedFlinkDeps ++ Seq(
     mvn"org.apache.flink:flink-table-common:${build.Constants.flinkVersion}",
+    // Iceberg Flink runtime: provided at compile time for BatchIrSourceBuilder.
+    // In production, deployed to Flink cluster's lib/ directory.
+    // In tests, this causes signer conflicts with flink-test-utils (Iceberg's shaded
+    // uber-jar bundles signed janino classes). The Iceberg integration test
+    // (IcebergBatchIrSourceIntegrationTest) is marked @Ignore and must run in isolation.
+    mvn"org.apache.iceberg:iceberg-flink-runtime-1.17:1.6.1",
     mvn"org.apache.spark::spark-core:${build.Constants.sparkVersion}",
     mvn"org.apache.spark::spark-sql:${build.Constants.sparkVersion}",
   )
@@ -34,7 +40,6 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
     mvn"com.google.protobuf:protobuf-java-util:${build.Constants.protobufVersion}",
     mvn"com.google.protobuf:protobuf-java:${build.Constants.protobufVersion}",
     mvn"org.apache.flink:flink-connector-kafka:3.0.2-1.18",
-    mvn"org.apache.iceberg:iceberg-flink-runtime-1.17:1.6.1",
     mvn"io.netty:netty-codec-http2:4.1.129.Final",
   )
 
@@ -76,7 +81,7 @@ trait FlinkModule extends Cross.Module[String] with build.BaseModule {
       // Force correct Jackson versions
       mvn"com.fasterxml.jackson.core:jackson-core:${build.Constants.jacksonVersion}",
       mvn"com.fasterxml.jackson.core:jackson-databind:${build.Constants.jacksonVersion}",
-      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonVersion}"
+      mvn"com.fasterxml.jackson.core:jackson-annotations:${build.Constants.jacksonVersion}",
     )
   }
 }
