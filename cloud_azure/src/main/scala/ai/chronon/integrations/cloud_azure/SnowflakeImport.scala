@@ -301,6 +301,7 @@ class SnowflakeImport(stagingQueryConf: api.StagingQuery, endPartition: String, 
         range.end,
         endPartition
       )
+    logger.info(s"Running query:\n$renderedQuery")
     val sfOptions = SnowflakeConnector.buildSparkConnectorOptions(snowflakeJdbcUrl, getPrivateKeyPem())
     val df = SnowflakeConnector.read(tableUtils.sparkSession, sfOptions, renderedQuery)
 

@@ -230,8 +230,13 @@ case object Snowflake extends Format {
         .flatMap { row =>
           if (row.isNullAt(0) || row.isNullAt(1)) None
           else {
-            val minMillis = row.getDate(0).toLocalDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli
-            val maxMillis = row.getDate(1).toLocalDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli
+            def toEpochMilli(value: Any): Long = value match {
+              case d: java.sql.Date        => d.toLocalDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli
+              case ld: java.time.LocalDate => ld.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli
+              case other => throw new IllegalArgumentException(s"Unexpected date type: ${other.getClass}")
+            }
+            val minMillis = toEpochMilli(row.get(0))
+            val maxMillis = toEpochMilli(row.get(1))
             Some(partitionSpec.expandRange(partitionSpec.at(minMillis), partitionSpec.at(maxMillis)))
           }
         }

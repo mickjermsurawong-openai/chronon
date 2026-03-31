@@ -21,8 +21,8 @@ object SnowflakeConnector {
 
   def extractPemBase64(pemContent: String): String =
     pemContent
-      .replaceAll("-----BEGIN.*-----", "")
-      .replaceAll("-----END.*-----", "")
+      .replaceFirst("-----BEGIN[^-]*-----", "")
+      .replaceFirst("-----END[^-]*-----", "")
       .replaceAll("\\s", "")
 
   def buildSparkConnectorOptions(jdbcUrl: String, pemContent: String): Map[String, String] = {
