@@ -268,13 +268,27 @@ class GigaTileStreamProcessor(
 
   // --- Private helpers ---
 
-  /** Recompute runningLargeIr from: batch (collapsed + tail hops) + streaming (today + yesterday). */
+  /** Recompute runningLargeIr from: batch (collapsed + tail hops) + streaming (today + yesterday).
+    * For columns where the entire window has moved past batchEndTs, the collapsed value
+    * is stale — zero it out so stale batch data doesn't persist for idle entities.
+    */
   private def recomputeRunningLargeIr(queryTs: Long, currentDayStart: Long): Unit = {
     val batchIr = store.getBatchIr
     val batchEndTs = store.getBatchEndTs
     val runningIr = if (batchIr != null) {
       val ir = windowedAgg.clone(batchIr.collapsed)
       megaTileAgg.mergeTailHopsForBatchColumns(ir, queryTs, batchEndTs, batchIr)
+      // Zero out columns where the window has moved entirely past batch data.
+      // collapsed covers [alignedCollapsedBoundary, batchEnd) — if the window start
+      // (queryTs - windowMillis) is past batchEnd, collapsed is outside the window.
+      var col = 0
+      while (col < windowedAgg.length) {
+        val window = megaTileAgg.windowMappings(col).aggregationPart.window
+        if (!isNoBatch(col) && window != null && queryTs - megaTileAgg.windowMappings(col).millis >= batchEndTs) {
+          ir(col) = null
+        }
+        col += 1
+      }
       ir
     } else {
       windowedAgg.init
