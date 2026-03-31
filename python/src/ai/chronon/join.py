@@ -322,6 +322,7 @@ def Join(
     cluster_conf: common.ClusterConfigProperties = None,
     step_days: int = None,
     enable_stats_compute: bool = None,
+    modular_execution: bool = False,
 ) -> api.Join:
     """
     Construct a join object. A join can pull together data from various GroupBy's both offline and online. This is also
@@ -424,6 +425,10 @@ def Join(
         Whether to enable enhanced statistics computation and upload for this join.
         When True, stats compute and upload nodes will be added to the workflow.
     :type enable_stats_compute: bool
+    :param modular_execution:
+        When True, uses modular join planning (JoinPlanner) instead of the default
+        monolith planner (MonolithJoinPlanner).
+    :type modular_execution: bool
     """
     # Normalize row_ids
     if isinstance(row_ids, str):
@@ -479,6 +484,15 @@ def Join(
     # Set default online_schedule if online is True and online_schedule is not specified
     if online and online_schedule is None:
         online_schedule = "@daily"
+
+    if modular_execution:
+        if conf is None:
+            conf = common.ConfigProperties(common={"modular_execution": "true"})
+        else:
+            if conf.common is None:
+                conf.common = {"modular_execution": "true"}
+            else:
+                conf.common["modular_execution"] = "true"
 
     exec_info = common.ExecutionInfo(
         offlineSchedule=offline_schedule,

@@ -27,12 +27,23 @@ object LocalRunner {
     .filterNot(isIgnorableFile)
     .map(ThriftJsonCodec.fromJsonFile(_, check = true))
 
+  private def isModularMode(join: Join): Boolean =
+    Option(join.metaData)
+      .flatMap(md => Option(md.executionInfo))
+      .flatMap(ei => Option(ei.conf))
+      .flatMap(c => Option(c.common))
+      .exists(_.get("modular_execution") == "true")
+
+  private def selectJoinPlanner(join: Join)(implicit partitionSpec: PartitionSpec): ConfPlanner[Join] =
+    if (isModularMode(join)) new JoinPlanner(join)
+    else MonolithJoinPlanner(join)
+
   def processConfigurations(confSubfolder: String, confType: String)(implicit
       partitionSpec: PartitionSpec): Seq[ConfPlan] = {
     confType match {
       case Constants.JoinFolder => {
         val confs = parseConfs[Join](confSubfolder)
-        confs.map((c) => MonolithJoinPlanner(c)).map(_.buildPlan)
+        confs.map(c => selectJoinPlanner(c).buildPlan)
       }
       case Constants.StagingQueryFolder => {
         val confs = parseConfs[StagingQuery](confSubfolder)
