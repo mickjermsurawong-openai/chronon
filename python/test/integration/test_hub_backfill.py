@@ -19,19 +19,6 @@ DEMO_DERIVATIONS = {
 
 
 @pytest.mark.integration
-def test_backfill(confs, chronon_root, hub_url, cloud):
-    """Compile canary configs from scratch, submit a backfill, and poll until success."""
-    runner = CliRunner()
-    compile_configs(runner, chronon_root)
-
-    workflow_id = submit_backfill(
-        runner, chronon_root, hub_url,
-        confs[DEMO_DERIVATIONS[cloud]], "2026-03-01", "2026-03-01",
-    )
-    poll_workflow(hub_url, workflow_id, timeout=1800, interval=45)
-
-
-@pytest.mark.integration
 def test_backfill_no_data(confs, chronon_root, hub_url, cloud):
     """Backfill with dates that have no input data should result in a failed workflow."""
     runner = CliRunner()

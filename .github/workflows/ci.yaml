@@ -322,7 +322,7 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [spark, non-spark, python-lint, python-tests, cosmos, redis, format, grype, integration_tests]
+    needs: [spark, non-spark, python-lint, python-tests, cosmos, redis, format, grype, build_and_push, integration_tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check CI results

@@ -1112,6 +1112,10 @@ def get_schedule_modes(conf_path: str):
     online_schedule = metadata_map["executionInfo"].get("onlineSchedule", None)
     offline_schedule = metadata_map["executionInfo"].get("offlineSchedule", None)
 
+    # "@never" explicitly disables online scheduling
+    if online_schedule == "@never":
+        online_schedule = None
+
     # Check if "online" is True before proceeding with online_schedule
     is_online = metadata_map.get("online", False)
     if not is_online:

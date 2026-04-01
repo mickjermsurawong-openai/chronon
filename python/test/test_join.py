@@ -97,3 +97,25 @@ def test_online_schedule_validation():
         online_schedule="0 2 * * *"  # Custom schedule
     )
     assert j.metaData.executionInfo.onlineSchedule == "0 2 * * *"
+
+    # Test that @never disables online scheduling even when online=True
+    j = join.Join(
+        left=event_source("table"),
+        right_parts=[right_part(event_source("table"))],
+        version=1,
+        row_ids=["id"],
+        online=True,
+        online_schedule="@never"
+    )
+    assert j.metaData.executionInfo.onlineSchedule is None
+
+    # Test that @never is accepted even when online=False
+    j = join.Join(
+        left=event_source("table"),
+        right_parts=[right_part(event_source("table"))],
+        version=1,
+        row_ids=["id"],
+        online=False,
+        online_schedule="@never"
+    )
+    assert j.metaData.executionInfo.onlineSchedule is None

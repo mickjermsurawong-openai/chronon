@@ -5,6 +5,7 @@ import click
 
 from ai.chronon.cli.theme import print_error
 from ai.chronon.repo.compile import __compile
+from ai.chronon.repo.utils import resolve_conf
 
 
 def handle_compile(func):
@@ -43,13 +44,17 @@ def handle_dry_run_compile(func):
 
 def handle_conf_not_found(log_error=True, callback=None):
     """
-    Handler for when a conf is not found
+    Handler for when a conf is not found.
+    Also resolves versioned conf paths: if conf doesn't exist but exactly one
+    conf__<version> file does, it is used automatically.
     """
 
     def wrapper(func):
         @functools.wraps(func)
         def wrapped(*args, **kwargs):
             try:
+                if "conf" in kwargs and "repo" in kwargs:
+                    kwargs["conf"] = resolve_conf(kwargs["repo"], kwargs["conf"])
                 return func(*args, **kwargs)
             except FileNotFoundError as e:
                 if log_error:

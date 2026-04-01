@@ -157,6 +157,7 @@ VALID_CLOUDS = ("gcp", "aws", "azure")
 
 # cloud provider
 AWS = "AWS"
+AZURE = "AZURE"
 GCP = "GCP"
 
 # arg keywords

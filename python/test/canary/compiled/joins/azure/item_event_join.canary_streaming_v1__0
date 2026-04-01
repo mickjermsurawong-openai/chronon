@@ -85,6 +85,7 @@
             "env": {
               "common": {
                 "ARTIFACT_PREFIX": "abfss://dev-zipline-artifacts@ziplineai2.dfs.core.windows.net",
+                "AUTH_SCOPE": "api://dev-zipline-auth",
                 "CHRONON_ONLINE_ARGS": "-Ztasks=4 -Zbootstrap=bootstrap.zipline-kafka-cluster.us-central1.managedkafka.canary-443022.cloud.goog:9092",
                 "CLOUD_PROVIDER": "azure",
                 "CUSTOMER_ID": "dev",
@@ -182,6 +183,7 @@
       "env": {
         "common": {
           "ARTIFACT_PREFIX": "abfss://dev-zipline-artifacts@ziplineai2.dfs.core.windows.net",
+          "AUTH_SCOPE": "api://dev-zipline-auth",
           "CHRONON_ONLINE_ARGS": " -Ztasks=4",
           "CLOUD_PROVIDER": "azure",
           "CUSTOMER_ID": "dev",

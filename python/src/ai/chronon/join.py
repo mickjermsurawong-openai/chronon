@@ -385,7 +385,7 @@ def Join(
         Note: Hourly, sub-hourly, or multi-daily schedules are not supported.
     :param online_schedule:
         Schedule expression for online/deploy tasks. When online=True and online_schedule is not specified,
-        defaults to "@daily". Set to None to explicitly disable online scheduling even when online=True.
+        defaults to "@daily". Set to "@never" to explicitly disable online scheduling even when online=True.
         Supports the same format as offline_schedule.
     :param row_ids:
         Columns of the left table that uniquely define a training record. Used as default keys during bootstrap
@@ -470,14 +470,17 @@ def Join(
         ]
 
     # Validate online_schedule based on online flag
-    if not online and online_schedule is not None:
+    if not online and online_schedule is not None and online_schedule != "@never":
         raise ValueError(
             "online_schedule cannot be set when online=False. "
             "Either set online=True or remove the online_schedule parameter."
         )
 
+    # "@never" explicitly disables online scheduling even when online=True
+    if online_schedule == "@never":
+        online_schedule = None
     # Set default online_schedule if online is True and online_schedule is not specified
-    if online and online_schedule is None:
+    elif online and online_schedule is None:
         online_schedule = "@daily"
 
     exec_info = common.ExecutionInfo(

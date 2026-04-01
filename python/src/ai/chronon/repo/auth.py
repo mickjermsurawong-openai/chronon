@@ -139,19 +139,19 @@ def get_user_email(url=None) -> str:
     return get_git_user_email()
 
 
-@click.group(help="Manage authentication for Zipline Hub.")
+@click.group(help="Manage authentication for Zipline.")
 def auth():
     pass
 
 
 @auth.command()
-@click.option("--url", default=None, help="Hub URL (e.g. https://zipline.example.com). Defaults to FRONTEND_URL from teams.py.")
+@click.option("--url", default=None, help="Zipline Auth URL (e.g. https://zipline.example.com). Defaults to FRONTEND_URL from teams.py.")
 @click.option("--no-browser", is_flag=True, help="Don't automatically open the browser")
 def login(url, no_browser):
-    """Authenticate with Zipline Hub via browser-based device flow."""
+    """Authenticate with Zipline via browser-based device flow."""
     if url is None:
         default_url = get_frontend_url_from_teams()
-        url = click.prompt("Zipline Hub URL", default=default_url or None)
+        url = click.prompt("Zipline Auth URL", default=default_url or None)
     base_url = url.rstrip("/")
 
     # Step 1: Request device code
@@ -260,19 +260,19 @@ def login(url, no_browser):
 
 
 @auth.command()
-@click.option("--url", default=None, help="Hub URL to log out of. If omitted, logs out of all hubs.")
+@click.option("--url", default=None, help="Zipline Auth URL to log out of. If omitted, logs out of all accounts.")
 def logout(url):
-    """Remove stored Zipline Hub credentials."""
+    """Remove stored Zipline credentials."""
     if url:
         clear_auth_config(url=url)
         print_success(f"Logged out of {url}.")
     else:
         clear_auth_config()
-        print_success("Logged out of all hubs.")
+        print_success("Logged out of all accounts.")
 
 
 @auth.command(name="get-access-token")
-@click.option("--url", default=None, help="Hub URL to get token for. Defaults to the most recently authenticated hub.")
+@click.option("--url", default=None, help="Zipline Auth URL to get token for. Defaults to the most recently authenticated account.")
 def get_access_token(url):
     """Print a JWT access token to stdout (for use in scripts and curl)."""
     config = get_auth_config(url=url)
@@ -301,7 +301,7 @@ def get_access_token(url):
 
 
 @auth.command()
-@click.option("--url", default=None, help="Hub URL to check status for. If omitted, shows all accounts.")
+@click.option("--url", default=None, help="Zipline Auth URL to check status for. If omitted, shows all accounts.")
 def status(url):
     """Show current authentication status."""
     data = _load_auth_data()

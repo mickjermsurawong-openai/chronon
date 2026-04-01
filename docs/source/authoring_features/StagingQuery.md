@@ -37,7 +37,6 @@ v1 = StagingQuery(
         AND
             b.ds between '{{ start_date }}' AND '{{ end_date }}'
     """,
-    startPartition="2020-04-01",
     setups=[
         "ADD JAR s3://path/to/your/jar",
         "CREATE TEMPORARY FUNCTION EMAIL_PARSE AS 'com.you_company.udf.your_team.YourUdfClass'",
@@ -79,7 +78,6 @@ from ai.chronon.staging_query import StagingQuery, EngineType
 v1 = StagingQuery(
     query="SELECT * FROM my_dataset.my_table WHERE ds BETWEEN '{{ start_date }}' AND '{{ end_date }}'",
     engine_type=EngineType.BIGQUERY,
-    startPartition="2020-04-01",
     metaData=MetaData(
         dependencies=["my_dataset.my_table"],
     )
@@ -95,7 +93,7 @@ metadata is extracted from [teams.json](https://github.com/zipline-ai/chronon/bl
 
 ## Date Logic and Template Parameters
 
-**IMPORTANT: Running a `StagingQuery` for a particular day (`ds`) does not only produce data for that `ds`, but rather everything from the `Earliest Missing Partition` up to the `ds`, where the `Earliest Missing Partition` is defined as the `earliest existing partition + 1` if any partitions exist, else the `startPartition` defined on the `StagingQuery`.**
+**IMPORTANT: Running a `StagingQuery` for a particular day (`ds`) does not only produce data for that `ds`, but rather everything from the `Earliest Missing Partition` up to the `ds`, where the `Earliest Missing Partition` is defined as the `earliest existing partition + 1` if any partitions exist, else the `--start-partition` passed to the CLI.**
 
 Usually this results in one big job for the first backfill, then smaller jobs for incremental frontfill.
 
@@ -138,7 +136,6 @@ v1 = StagingQuery(
         WHERE event_ts >= {{ start_date }}
           AND event_ts < {{ end_date(offset=1) }}
     """,
-    startPartition="2024-01-01",
     metaData=MetaData(
         dependencies=[
             TableDependency(

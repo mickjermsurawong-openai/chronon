@@ -25,7 +25,7 @@ class ZiplineHub:
     ):
         if not base_url:
             raise ValueError("Base URL for ZiplineHub cannot be empty.")
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.eval_url = eval_url
         self.format = format
         self.cloud_provider = (
@@ -342,6 +342,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling diff API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "diff")
             print_error(f"Error calling diff API: {self._get_error_details(e)}", format=self.format)
@@ -361,6 +369,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling upload API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "upload")
             print_error(f"Error calling upload API: {self._get_error_details(e)}", format=self.format)
@@ -382,6 +398,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error deploying schedule: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "schedule deploy")
             print_error(f"Error deploying schedule: {self._get_error_details(e)}", format=self.format)
@@ -426,6 +450,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error deploying schedules: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "schedule-all")
             print_error(f"Error deploying schedules: {self._get_error_details(e)}", format=self.format)
@@ -438,6 +470,14 @@ class ZiplineHub:
             response = requests.post(url, headers=self.additional_headers(self.base_url))
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling workflow cancel API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "workflow cancel")
             print_error(f"Error calling workflow cancel API: {self._get_error_details(e)}", format=self.format)
@@ -457,6 +497,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling sync API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "sync")
             print_error(f"Error calling sync API: {self._get_error_details(e)}", format=self.format)
@@ -484,6 +532,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling eval API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "eval")
             print_error(f"Error calling eval API: {self._get_error_details(e)}", format=self.format)
@@ -510,6 +566,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling schema API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "schema")
             print_error(f"Error calling schema API: {self._get_error_details(e)}", format=self.format)
@@ -536,6 +600,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling list-tables API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "list-tables")
             print_error(f"Error calling list-tables API: {self._get_error_details(e)}", format=self.format)
@@ -575,6 +647,14 @@ class ZiplineHub:
             )
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error calling workflow start API: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
         except requests.RequestException as e:
             self.handle_unauth(e, "workflow start")
             print_error(f"Error calling workflow start API: {self._get_error_details(e)}", format=self.format)

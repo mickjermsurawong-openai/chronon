@@ -22,6 +22,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.scalatest.flatspec.AnyFlatSpec
 
+import scala.jdk.CollectionConverters._
 import scala.util.Try
 
 class TableUtilsFormatTest extends AnyFlatSpec {
@@ -159,6 +160,27 @@ class TableUtilsFormatTest extends AnyFlatSpec {
     val tableName = s"$dbName.test_table_nonexistent_$format"
     assertTrue(FormatProvider.from(spark).readFormat(tableName).isEmpty)
     assertFalse(tableUtils.tableReachable(tableName))
+  }
+
+  it should "log a clean one-liner for non-existent table without stack trace" in {
+    val loggerName = classOf[TableUtils].getName
+    val underlying = org.slf4j.LoggerFactory.getLogger(loggerName).asInstanceOf[ch.qos.logback.classic.Logger]
+    val appender = new ch.qos.logback.core.read.ListAppender[ch.qos.logback.classic.spi.ILoggingEvent]()
+    appender.start()
+    underlying.addAppender(appender)
+    try {
+      val tableName = s"db_nonexistent_${System.currentTimeMillis()}.no_such_table"
+      assertFalse(tableUtils.tableReachable(tableName))
+
+      val messages = appender.list.asScala.map(_.getFormattedMessage)
+      val relevant = messages.filter(_.contains(tableName))
+      assertTrue(s"Expected exactly one log message for $tableName, got: $relevant", relevant.size == 1)
+      assertTrue(s"Expected clean message, got: ${relevant.head}",
+        relevant.head == s"Cannot find table or view $tableName.")
+    } finally {
+      underlying.detachAppender(appender)
+      appender.stop()
+    }
   }
 }
 

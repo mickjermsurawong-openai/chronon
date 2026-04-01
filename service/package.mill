@@ -16,7 +16,6 @@ trait ServiceModule extends Cross.Module[String] with build.BaseModule {
       mvn"io.vertx:vertx-web:4.5.24",
       mvn"io.micrometer:micrometer-registry-otlp:1.13.6".exclude("com.google.protobuf" -> "protobuf-java"),
       mvn"io.micrometer:micrometer-registry-prometheus:1.10.13".exclude("com.google.protobuf" -> "protobuf-java"),
-      mvn"io.netty:netty-all:4.1.129.Final",
       mvn"org.scala-lang:scala-reflect:${scalaVersion()}",
       mvn"org.scala-lang:scala-compiler:${scalaVersion()}",
       // add the version of protobuf that is compatible with our cloud deps 
@@ -49,6 +48,7 @@ trait ServiceModule extends Cross.Module[String] with build.BaseModule {
           .exclude("org.apache.zookeeper" -> "zookeeper")
           .exclude("org.apache.zookeeper" -> "zookeeper-jute"),
         mvn"io.airlift:aircompressor:2.0.3",
+        mvn"io.netty:netty-all:4.1.132.Final",
       ).map(_.forceVersion())
 
   override def resources = Task.Sources(

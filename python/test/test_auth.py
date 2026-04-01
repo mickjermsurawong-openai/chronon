@@ -359,7 +359,7 @@ class TestLogoutCommand:
         result = runner.invoke(auth, ["logout"])
 
         assert result.exit_code == 0
-        assert "Logged out of all hubs" in result.output
+        assert "Logged out of all accounts" in result.output
         assert not auth_file.exists()
 
     def test_logout_when_not_authenticated(self, auth_dir):
@@ -659,4 +659,4 @@ class TestLoginDefaultUrl:
         with patch("ai.chronon.repo.auth.get_frontend_url_from_teams", return_value=None):
             result = runner.invoke(auth, ["login", "--no-browser"], input="https://prompted.example.com\n")
 
-        assert "Zipline Hub URL" in result.output
+        assert "Zipline Auth URL" in result.output

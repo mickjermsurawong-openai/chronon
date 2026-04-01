@@ -279,3 +279,91 @@ jobs:
 
           gcloud storage cp connectors_pubsub_deploy.jar gs://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/connectors_pubsub_deploy.jar
           gcloud storage objects update gs://zipline-artifacts-canary/release/${{ needs.build_artifacts.outputs.version }}/jars/connectors_pubsub_deploy.jar --custom-metadata="updated_date=$(date),commit=$(git rev-parse HEAD),branch=$(git rev-parse --abbrev-ref HEAD)"
+
+  push_to_azure:
+    needs: build_artifacts
+    runs-on: ubuntu-latest
+    environment: azure
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download Python Wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: zipline-ai-wheel
+
+      - name: Download Flink Assembly Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: flink-assembly-jar
+          path: flink-assembly-jar
+
+      - name: Download Service Assembly Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: service-assembly-jar
+          path: service-assembly-jar
+
+      - name: Download Cloud Azure Lib Jar
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-azure-jar
+          path: cloud-azure-jar
+
+      - name: Rename JAR files to expected names
+        run: |
+          mv cloud-azure-jar/out.jar cloud_azure_lib_deploy.jar
+          mv flink-assembly-jar/out.jar flink_assembly_deploy.jar
+          mv service-assembly-jar/out.jar service_assembly_deploy.jar
+
+      - name: Push Jars to Azure Blob Storage
+        shell: bash
+        run: |
+          set -eo pipefail
+          VERSION="${{ needs.build_artifacts.outputs.version }}"
+          ACCOUNT="ziplineai2"
+          CONTAINER="dev-zipline-artifacts"
+
+          az storage blob upload \
+            --account-name $ACCOUNT \
+            --auth-mode login \
+            --container-name $CONTAINER \
+            --file cloud_azure_lib_deploy.jar \
+            --name release/${VERSION}/jars/cloud_azure_lib_deploy.jar \
+            --overwrite
+
+          az storage blob upload \
+            --account-name $ACCOUNT \
+            --auth-mode login \
+            --container-name $CONTAINER \
+            --file flink_assembly_deploy.jar \
+            --name release/${VERSION}/jars/flink_assembly_deploy.jar \
+            --overwrite
+
+          az storage blob upload \
+            --account-name $ACCOUNT \
+            --auth-mode login \
+            --container-name $CONTAINER \
+            --file service_assembly_deploy.jar \
+            --name release/${VERSION}/jars/service_assembly_deploy.jar \
+            --overwrite
+
+          az storage blob upload \
+            --account-name $ACCOUNT \
+            --auth-mode login \
+            --container-name $CONTAINER \
+            --file ${{ needs.build_artifacts.outputs.wheel_name }} \
+            --name release/${VERSION}/wheels/${{ needs.build_artifacts.outputs.wheel_name }} \
+            --overwrite

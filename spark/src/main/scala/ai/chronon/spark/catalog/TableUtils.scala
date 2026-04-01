@@ -86,6 +86,11 @@ class TableUtils(@transient val sparkSession: SparkSession) extends Serializable
   def tableReachable(tableName: String, ignoreFailure: Boolean = false): Boolean = {
     Try { sparkSession.table(tableName) } match {
       case Success(_) => true
+      case Failure(ex: AnalysisException) if ex.getMessage.contains("TABLE_OR_VIEW_NOT_FOUND") =>
+        if (!ignoreFailure) {
+          logger.info(s"Cannot find table or view $tableName.")
+        }
+        false
       case Failure(ex) =>
         if (!ignoreFailure) {
           logger.info(s"""Couldn't reach $tableName. Error: ${ex.traceString.red}

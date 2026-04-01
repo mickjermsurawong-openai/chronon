@@ -23,11 +23,13 @@ from .helpers.cli import (
 START_DS = {
     "gcp": "2023-11-01",
     "aws": "2026-01-07",
+    "azure": "2023-11-01",
 }
 
 END_DS = {
     "gcp": "2023-11-30",
     "aws": "2026-02-10",
+    "azure": "2023-11-30",
 }
 
 STAGING_QUERY_IMPORT_KEYS = {
@@ -42,16 +44,22 @@ STAGING_QUERY_IMPORT_KEYS = {
         "compiled/staging_queries/aws/exports.dim_listings__0",
         "compiled/staging_queries/aws/exports.dim_merchants__0",
     ],
+    "azure": [
+        "compiled/staging_queries/azure/exports.user_activities__0",
+        "compiled/staging_queries/azure/exports.checkouts__0",
+    ],
 }
 
 GROUP_BY_KEY = {
     "gcp": "compiled/group_bys/gcp/purchases.v1_test__0",
     "aws": "compiled/group_bys/aws/user_activities.v1__1",
+    "azure": "compiled/group_bys/azure/purchases.v1_test__0",
 }
 
 JOIN_KEY = {
     "gcp": "compiled/joins/gcp/training_set.v1_test__0",
     "aws": "compiled/joins/aws/demo.v1__1",
+    "azure": "compiled/joins/azure/training_set.v1_test__0",
 }
 
 

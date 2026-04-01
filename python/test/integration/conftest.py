@@ -84,18 +84,10 @@ def chronon_root() -> str:
 # Per-test fixtures
 # ---------------------------------------------------------------------------
 
-ARTIFACT_PREFIXES = {
-    "gcp": "gs://zipline-artifacts-canary",
-    "aws": "s3://zipline-artifacts-canary",
-    "azure": "abfss://zipline-artifacts-canary",
-}
-
-
 @pytest.fixture(autouse=True)
 def chronon_env(monkeypatch, chronon_root, cloud):
     """Set up the environment variables and sys.path needed by canary configs."""
     monkeypatch.setenv("PYTHONPATH", chronon_root)
-    monkeypatch.setenv("ARTIFACT_PREFIX", ARTIFACT_PREFIXES[cloud])
     monkeypatch.setenv("CUSTOMER_ID", "canary")
     monkeypatch.syspath_prepend(chronon_root)
 

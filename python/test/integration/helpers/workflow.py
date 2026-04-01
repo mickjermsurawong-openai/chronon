@@ -57,10 +57,10 @@ def poll_workflow_until(
     raises ``RuntimeError``.  If the timeout expires, raises ``AssertionError``.
     """
     url = f"{hub_url}/workflow/v2/{workflow_id}"
-    headers = _get_auth_headers()
 
     deadline = time.time() + timeout
     while True:
+        headers = _get_auth_headers()
         resp = requests.get(url, headers=headers)
         resp.raise_for_status()
         data = resp.json()

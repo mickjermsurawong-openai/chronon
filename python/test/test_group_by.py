@@ -424,3 +424,35 @@ def test_online_schedule_validation():
         online_schedule="0 2 * * *"  # Custom schedule
     )
     assert gb.metaData.executionInfo.onlineSchedule == "0 2 * * *"
+
+    # Test that @never disables online scheduling even when online=True
+    gb = group_by.GroupBy(
+        sources=event_source("table"),
+        keys=["subject"],
+        aggregations=group_by.Aggregations(
+            count=group_by.Aggregation(
+                input_column="event_id",
+                operation=group_by.Operation.COUNT
+            ),
+        ),
+        version=1,
+        online=True,
+        online_schedule="@never"
+    )
+    assert gb.metaData.executionInfo.onlineSchedule is None
+
+    # Test that @never is accepted even when online=False
+    gb = group_by.GroupBy(
+        sources=event_source("table"),
+        keys=["subject"],
+        aggregations=group_by.Aggregations(
+            count=group_by.Aggregation(
+                input_column="event_id",
+                operation=group_by.Operation.COUNT
+            ),
+        ),
+        version=1,
+        online=False,
+        online_schedule="@never"
+    )
+    assert gb.metaData.executionInfo.onlineSchedule is None

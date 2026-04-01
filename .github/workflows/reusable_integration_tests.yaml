@@ -10,6 +10,7 @@ on:
 jobs:
   run_aws_integration_tests:
     runs-on: ubuntu-latest
+    environment: aws
 
     container:
       image: ghcr.io/${{ github.repository }}-ci:latest
@@ -115,6 +116,7 @@ jobs:
 
   run_gcp_integration_tests:
     runs-on: ubuntu-latest
+    environment: gcp
 
     container:
       image: ghcr.io/${{ github.repository }}-ci:latest

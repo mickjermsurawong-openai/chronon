@@ -27,9 +27,15 @@ from ai.chronon.repo.aws import (
     ZIPLINE_AWS_ONLINE_CLASS_DEFAULT,
     AwsRunner,
 )
+from ai.chronon.repo.azure_runner import (
+    ZIPLINE_AZURE_JAR_DEFAULT,
+    ZIPLINE_AZURE_ONLINE_CLASS_DEFAULT,
+    AzureRunner,
+)
 from ai.chronon.repo.constants import (
     APP_NAME_TEMPLATE,
     AWS,
+    AZURE,
     CLOUD_PROVIDER_KEYWORD,
     GCP,
     MODE_ARGS,
@@ -46,7 +52,7 @@ from ai.chronon.repo.gcp import (
     ZIPLINE_GCP_ONLINE_CLASS_DEFAULT,
     GcpRunner,
 )
-from ai.chronon.repo.utils import get_environ_arg, set_runtime_env_v3
+from ai.chronon.repo.utils import get_environ_arg, resolve_conf, set_runtime_env_v3
 
 
 # TODO: @davidhan - we should move these to all be in the defaults of the choice args
@@ -289,6 +295,7 @@ def main(
     unknown_args = ctx.args
     click.echo("Running with args: {}".format(ctx.params))
 
+    conf = resolve_conf(repo, conf)
     conf_path = os.path.join(repo, conf)
     if not os.path.isfile(conf_path):
         raise ValueError(f"Conf file {conf_path} does not exist.")
@@ -319,6 +326,11 @@ def main(
         ctx.params[ONLINE_CLASS_ARG] = ZIPLINE_AWS_ONLINE_CLASS_DEFAULT
         ctx.params[CLOUD_PROVIDER_KEYWORD] = cloud_provider
         AwsRunner(ctx.params).run()
+    elif cloud_provider.upper() == AZURE:
+        ctx.params[ONLINE_JAR_ARG] = ZIPLINE_AZURE_JAR_DEFAULT
+        ctx.params[ONLINE_CLASS_ARG] = ZIPLINE_AZURE_ONLINE_CLASS_DEFAULT
+        ctx.params[CLOUD_PROVIDER_KEYWORD] = cloud_provider
+        AzureRunner(ctx.params).run()
     else:
         raise ValueError(f"Unsupported cloud provider: {cloud_provider}")
 

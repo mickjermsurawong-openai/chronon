@@ -25,6 +25,17 @@ from ai.chronon.repo.zipline_hub import ZiplineHub
 class TestZiplineHub:
     """Test cases for ZiplineHub class."""
 
+    def test_base_url_strips_trailing_slash(self):
+        """Test that base_url strips trailing slashes."""
+        hub_with_slash = ZiplineHub("http://example.com/")
+        assert hub_with_slash.base_url == "http://example.com"
+
+        hub_with_multiple_slashes = ZiplineHub("http://example.com///")
+        assert hub_with_multiple_slashes.base_url == "http://example.com"
+
+        hub_without_slash = ZiplineHub("http://example.com")
+        assert hub_without_slash.base_url == "http://example.com"
+
     @patch("requests.post")
     def test_call_workflow_start_api_with_default_dates(self, mock_post):
         """Test workflow start API call with default dates."""

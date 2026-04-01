@@ -27,8 +27,10 @@ trait PubSubConnectorModule extends Cross.Module[String] with build.BaseModule {
       .exclude("com.fasterxml.jackson.core" -> "jackson-core")
       .exclude("com.fasterxml.jackson.core" -> "jackson-databind")
       .exclude("com.fasterxml.jackson.core" -> "jackson-annotations"),
-    mvn"io.netty:netty-codec-http2:4.1.129.Final",
-  )
+  ) ++ Seq(
+    mvn"io.netty:netty-codec-http2:4.1.132.Final",
+    mvn"io.netty:netty-codec-http:4.1.132.Final",
+  ).map(_.forceVersion())
 
   object test extends build.BaseTestModule {
     def scalaVersion = crossValue

@@ -27,97 +27,7 @@ jobs:
       version: ${{ needs.build_and_push.outputs.version }}
     secrets: inherit
 
-  push_to_azure:
-    needs: build_and_push
-    runs-on: ubuntu-latest
-    environment: main
-
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Download Python Wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: zipline-ai-wheel
-
-      - name: Download Flink Assembly Jar
-        uses: actions/download-artifact@v4
-        with:
-          name: flink-assembly-jar
-          path: flink-assembly-jar
-
-      - name: Download Service Assembly Jar
-        uses: actions/download-artifact@v4
-        with:
-          name: service-assembly-jar
-          path: service-assembly-jar
-
-      - name: Download Cloud Azure Lib Jar
-        uses: actions/download-artifact@v4
-        with:
-          name: cloud-azure-jar
-          path: cloud-azure-jar
-
-      - name: Rename JAR files to expected names
-        run: |
-          mv cloud-azure-jar/out.jar cloud_azure_lib_deploy.jar
-          mv flink-assembly-jar/out.jar flink_assembly_deploy.jar
-          mv service-assembly-jar/out.jar service_assembly_deploy.jar
-
-      - name: Push Jars to Azure Blob Storage
-        shell: bash
-        run: |
-          set -eo pipefail
-          VERSION="${{ needs.build_and_push.outputs.version }}"
-          ACCOUNT="ziplineai2"
-          CONTAINER="dev-zipline-artifacts"
-
-          az storage blob upload \
-            --account-name $ACCOUNT \
-            --auth-mode login \
-            --container-name $CONTAINER \
-            --file cloud_azure_lib_deploy.jar \
-            --name release/${{ needs.build_and_push.outputs.version }}/jars/cloud_azure_lib_deploy.jar \
-            --tier cool \
-            --overwrite
-
-          az storage blob upload \
-            --account-name $ACCOUNT \
-            --auth-mode login \
-            --container-name $CONTAINER \
-            --file flink_assembly_deploy.jar \
-            --name release/${{ needs.build_and_push.outputs.version }}/jars/flink_assembly_deploy.jar \
-            --tier cool \
-            --overwrite
-
-          az storage blob upload \
-            --account-name $ACCOUNT \
-            --auth-mode login \
-            --container-name $CONTAINER \
-            --file service_assembly_deploy.jar \
-            --name release/${{ needs.build_and_push.outputs.version }}/jars/service_assembly_deploy.jar \
-            --tier cool \
-            --overwrite
-
-          az storage blob upload \
-            --account-name $ACCOUNT \
-            --auth-mode login \
-            --container-name $CONTAINER \
-            --file ${{ needs.build_and_push.outputs.wheel_name }} \
-            --name release/${{ needs.build_and_push.outputs.version }}/wheels/${{ needs.build_and_push.outputs.wheel_name }} \
-            --tier cool \
-            --overwrite
+  # Azure push is now handled by reusable_build_and_push.yaml (inside build_and_push)
 
   build_and_push_fetcher_image:
     needs: [build_and_push, integration_tests]
@@ -350,7 +260,7 @@ jobs:
 
 
   push_to_azure_passing:
-    needs: [build_and_push, push_to_azure]
+    needs: [build_and_push, integration_tests]
     runs-on: ubuntu-latest
     environment: main
 
