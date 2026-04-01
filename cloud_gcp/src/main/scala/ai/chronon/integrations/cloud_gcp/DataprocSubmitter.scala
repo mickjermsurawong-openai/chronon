@@ -607,7 +607,9 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
     val result = resolveLatestCheckpointPath(flinkInternalJobId, s"$flinkStateUri/checkpoints")
     result match {
       case Some(path) => logger.info(s"Resolved latest checkpoint for Flink job $flinkInternalJobId: $path")
-      case None       => logger.warn(s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
+      case None =>
+        logger.warn(
+          s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
     }
     result
   }

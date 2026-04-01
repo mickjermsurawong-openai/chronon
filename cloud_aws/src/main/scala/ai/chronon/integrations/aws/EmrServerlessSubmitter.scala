@@ -383,7 +383,9 @@ class EmrServerlessSubmitter(
     val result = S3StorageClient.resolveLatestCheckpointPath(s3, flinkInternalJobId, flinkStateUri)
     result match {
       case Some(path) => logger.info(s"Resolved latest checkpoint for Flink job $flinkInternalJobId: $path")
-      case None       => logger.warn(s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
+      case None =>
+        logger.warn(
+          s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
     }
     result
   }

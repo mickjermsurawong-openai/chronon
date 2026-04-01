@@ -75,13 +75,13 @@ private[aws] object S3StorageClient {
     * returns the path to the highest-numbered checkpoint, or None if none exist.
     */
   def resolveLatestCheckpointPath(s3Client: S3Client,
-                                   flinkInternalJobId: String,
-                                   flinkStateUri: String): Option[String] =
+                                  flinkInternalJobId: String,
+                                  flinkStateUri: String): Option[String] =
     resolveLatestCheckpointPath(new S3StorageClient(s3Client), flinkInternalJobId, flinkStateUri)
 
   def resolveLatestCheckpointPath(storageClient: StorageClient,
-                                   flinkInternalJobId: String,
-                                   flinkStateUri: String): Option[String] = {
+                                  flinkInternalJobId: String,
+                                  flinkStateUri: String): Option[String] = {
     val jobCheckpointPath = s"$flinkStateUri/checkpoints/$flinkInternalJobId"
     val latestCheckpoint = storageClient
       .listFiles(jobCheckpointPath)
