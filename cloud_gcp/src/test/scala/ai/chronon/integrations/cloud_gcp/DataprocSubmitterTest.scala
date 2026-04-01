@@ -1382,4 +1382,75 @@ class DataprocSubmitterTest extends AnyFlatSpec with MockitoSugar {
       submitter.buildFlinkSubmissionProps(Map.empty, testVersion, testArtifactPrefix)
     }
   }
+
+  it should "getLatestCheckpointPath returns the highest-numbered checkpoint" in {
+    val mockGcsClient = mock[GCSClient]
+    val flinkJobId = "abc123"
+    val flinkStateUri = "gs://my-bucket/flink-state"
+    val checkpointBase = s"$flinkStateUri/checkpoints/$flinkJobId"
+
+    when(mockGcsClient.listFiles(checkpointBase)).thenReturn(
+      Iterator(
+        s"$checkpointBase/chk-3/_metadata",
+        s"$checkpointBase/chk-1/_metadata",
+        s"$checkpointBase/chk-10/_metadata",
+        s"$checkpointBase/chk-2/_metadata"
+      )
+    )
+
+    val submitter = new DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
+                                          gcsClient = mockGcsClient,
+                                          region = "test-region",
+                                          projectId = "test-project")
+
+    val result = submitter.getLatestCheckpointPath(flinkJobId, flinkStateUri)
+    assertEquals(Some(s"$checkpointBase/chk-10"), result)
+  }
+
+  it should "getLatestCheckpointPath returns None when no checkpoints exist" in {
+    val mockGcsClient = mock[GCSClient]
+    val flinkJobId = "abc123"
+    val flinkStateUri = "gs://my-bucket/flink-state"
+    val checkpointBase = s"$flinkStateUri/checkpoints/$flinkJobId"
+
+    when(mockGcsClient.listFiles(checkpointBase)).thenReturn(Iterator.empty)
+
+    val submitter = new DataprocSubmitter(jobControllerClient = mock[JobControllerClient],
+                                          gcsClient = mockGcsClient,
+                                          region = "test-region",
+                                          projectId = "test-project")
+
+    val result = submitter.getLatestCheckpointPath(flinkJobId, flinkStateUri)
+    assertEquals(None, result)
+  }
+
+  it should "getFlinkInternalJobId delegates to flinkInternalJobIdFetchFn" in {
+    val mockJobControllerClient = mock[JobControllerClient]
+    val flinkJobId = "flink-internal-uuid-123"
+    val dataprocJobId = "dataproc-job-456"
+
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mockJobControllerClient,
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      flinkInternalJobIdFetchFn = _ => Some(flinkJobId)
+    )
+
+    val result = submitter.getFlinkInternalJobId(dataprocJobId)
+    assertEquals(Some(flinkJobId), result)
+  }
+
+  it should "getFlinkInternalJobId returns None when fetch fn returns None" in {
+    val submitter = new DataprocSubmitter(
+      jobControllerClient = mock[JobControllerClient],
+      gcsClient = mock[GCSClient],
+      region = "test-region",
+      projectId = "test-project",
+      flinkInternalJobIdFetchFn = _ => None
+    )
+
+    val result = submitter.getFlinkInternalJobId("any-job-id")
+    assertEquals(None, result)
+  }
 }

@@ -8,6 +8,7 @@ import software.amazon.awssdk.services.emr.EmrClient
 import software.amazon.awssdk.services.emr.model.ListStudiosRequest
 import software.amazon.awssdk.services.emrserverless.EmrServerlessClient
 import software.amazon.awssdk.services.emrserverless.model._
+import software.amazon.awssdk.services.s3.S3Client
 
 import java.util.concurrent.ConcurrentHashMap
 import scala.concurrent.ExecutionContext
@@ -28,6 +29,8 @@ class EmrServerlessSubmitter(
     ingressBaseUrl: Option[String] = None,
     emrStudioId: Option[String] = None,
     flinkHealthCheckFn: Option[String] => Boolean = _ => true,
+    flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
+    s3Client: Option[S3Client] = None,
     cloudWatchLogGroupName: Option[String] = None,
     applicationName: String = EmrServerlessSubmitter.DefaultApplicationName
 ) extends JobSubmitter {
@@ -369,6 +372,22 @@ class EmrServerlessSubmitter(
     ingressBaseUrl.map(base => s"${base.stripSuffix("/")}/flink/$deploymentName/")
   }
 
+  override def getFlinkInternalJobId(jobId: String): Option[String] =
+    flinkInternalJobIdFetchFn(getFlinkUrl(jobId))
+
+  override def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = {
+    val s3 = s3Client.getOrElse {
+      logger.warn(s"S3 client not available, cannot resolve checkpoint path for Flink job $flinkInternalJobId")
+      return None
+    }
+    val result = S3StorageClient.resolveLatestCheckpointPath(s3, flinkInternalJobId, flinkStateUri)
+    result match {
+      case Some(path) => logger.info(s"Resolved latest checkpoint for Flink job $flinkInternalJobId: $path")
+      case None       => logger.warn(s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
+    }
+    result
+  }
+
   override def buildFlinkSubmissionProps(env: Map[String, String],
                                          version: String,
                                          artifactPrefix: String): Map[String, String] = {
@@ -480,6 +499,8 @@ object EmrServerlessSubmitter {
       cloudWatchLogGroupName: Option[String] = None,
       k8sConfig: Option[io.fabric8.kubernetes.client.Config] = None,
       flinkHealthCheckFn: Option[String] => Boolean = _ => true,
+      flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
+      s3Client: Option[S3Client] = None,
       applicationName: String = DefaultApplicationName,
       kvStoreApiProperties: Map[String, String] = Map.empty
   ): EmrServerlessSubmitter = {
@@ -502,6 +523,8 @@ object EmrServerlessSubmitter {
       ingressBaseUrl = ingressBaseUrl,
       emrStudioId = emrStudioId,
       flinkHealthCheckFn = flinkHealthCheckFn,
+      flinkInternalJobIdFetchFn = flinkInternalJobIdFetchFn,
+      s3Client = s3Client,
       cloudWatchLogGroupName = cloudWatchLogGroupName,
       applicationName = applicationName,
       kvStoreApiProperties = kvStoreApiProperties

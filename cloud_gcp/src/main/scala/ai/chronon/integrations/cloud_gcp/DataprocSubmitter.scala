@@ -25,7 +25,8 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
                         bigtableInstanceId: String = "",
                         override val tablePartitionsDataset: String = "",
                         override val dqMetricsDataset: String = "",
-                        flinkHealthCheckFn: Option[String] => Boolean = _ => true)
+                        flinkHealthCheckFn: Option[String] => Boolean = _ => true,
+                        flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None)
     extends JobSubmitter {
 
   def listRunningGroupByFlinkJobs(groupByName: String): List[String] = {
@@ -55,6 +56,18 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
     labels.get(DataprocUtils.formatDataprocLabel(ZiplineVersion))
   }
 
+  private def resolveLatestCheckpointPath(flinkJobId: String, checkpointBasePath: String): Option[String] = {
+    val jobCheckpointPath = s"$checkpointBasePath/$flinkJobId"
+    val matchedFiles = gcsClient.listFiles(jobCheckpointPath).toList
+    val latestCheckpoint = matchedFiles
+      .filter(_.split("/").exists(_.startsWith("chk-")))
+      .map(_.split("/").find(_.startsWith("chk-")).get)
+      .distinct
+      .sortBy(_.substring(4).toInt)(Ordering.Int.reverse)
+      .headOption
+    latestCheckpoint.map(chk => s"$jobCheckpointPath/$chk")
+  }
+
   def getLatestFlinkCheckpoint(groupByName: String,
                                manifestBucketPath: String,
                                flinkCheckpointUri: String): Option[String] = {
@@ -76,27 +89,8 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
       .map(_.split("=")(1))
       .getOrElse(throw new RuntimeException("Flink job id not found in manifest file."))
 
-    val flinkJobIdCheckpointPath = s"$flinkCheckpointUri/$flinkJobId"
-    val matchedFiles = gcsClient.listFiles(flinkJobIdCheckpointPath).toList
-    val allCheckpoints = matchedFiles
-      .filter(_.split("/").exists(_.startsWith("chk-")))
-      .map(_.split("/").find(_.startsWith("chk-")).get)
-      .distinct
-      .sortBy(chk => chk.substring(4).toInt)(Ordering.Int.reverse)
-    logger.info(s"Flink checkpoints for $groupByName: $allCheckpoints")
-
-    val latestCheckpoint = allCheckpoints.headOption
-    val latestCheckpointUri = latestCheckpoint
-      .map(chk => {
-        s"$flinkJobIdCheckpointPath/$chk"
-      })
-
-    if (latestCheckpointUri.isEmpty) {
-      logger.info(s"No checkpoints found for $groupByName.")
-    } else {
-      logger.info(s"Latest checkpoint for $groupByName: ${latestCheckpointUri.get}")
-    }
-
+    val latestCheckpointUri = resolveLatestCheckpointPath(flinkJobId, flinkCheckpointUri)
+    logger.info(s"Latest checkpoint for $groupByName: $latestCheckpointUri")
     latestCheckpointUri
   }
 
@@ -604,6 +598,18 @@ class DataprocSubmitter(jobControllerClient: JobControllerClient,
         s"$baseUrl/gateway/default/yarn/proxy/$appId/"
       }
     }
+  }
+
+  override def getFlinkInternalJobId(jobId: String): Option[String] =
+    flinkInternalJobIdFetchFn(getFlinkUrl(jobId))
+
+  override def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = {
+    val result = resolveLatestCheckpointPath(flinkInternalJobId, s"$flinkStateUri/checkpoints")
+    result match {
+      case Some(path) => logger.info(s"Resolved latest checkpoint for Flink job $flinkInternalJobId: $path")
+      case None       => logger.warn(s"No checkpoints found for Flink job $flinkInternalJobId at $flinkStateUri/checkpoints/$flinkInternalJobId")
+    }
+    result
   }
 
   override def deprecatedClusterNameEnvVars: Seq[String] = Seq(GcpDataprocClusterNameEnvVar)

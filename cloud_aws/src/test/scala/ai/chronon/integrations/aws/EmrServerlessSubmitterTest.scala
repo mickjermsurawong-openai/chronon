@@ -3,7 +3,7 @@ package ai.chronon.integrations.aws
 import ai.chronon.api.JobStatusType
 import ai.chronon.spark.submission
 import ai.chronon.spark.submission.JobSubmitterConstants._
-import ai.chronon.spark.submission.FlinkJob
+import ai.chronon.spark.submission.{FlinkJob, StorageClient}
 import org.junit.Assert.assertEquals
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers._
@@ -60,7 +60,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       kvStoreApiProperties: Map[String, String] = Map(
         "AWS_DYNAMODB_TABLE_NAME" -> "test-table",
         "AWS_DEFAULT_REGION" -> "us-east-1"
-      )
+      ),
+      s3Client: Option[software.amazon.awssdk.services.s3.S3Client] = None
   ): EmrServerlessSubmitter = {
     new EmrServerlessSubmitter(
       mockClient,
@@ -72,7 +73,8 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       ingressBaseUrl = ingressBaseUrl,
       emrStudioId = emrStudioId,
       applicationName = applicationName,
-      kvStoreApiProperties = kvStoreApiProperties
+      kvStoreApiProperties = kvStoreApiProperties,
+      s3Client = s3Client
     )
   }
 
@@ -1157,6 +1159,67 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
 
     val props = requestCaptor.getValue.configurationOverrides().applicationConfiguration().get(0).properties()
     props.get("spark.some.token") shouldBe "{CHRONON_NONEXISTENT_VAR_XYZ}"
+  }
+
+  "getLatestCheckpointPath" should "return the highest-numbered checkpoint" in {
+    val mockStorageClient = mock[StorageClient]
+    val flinkJobId = "abc123"
+    val flinkStateUri = "s3://my-bucket/flink-state"
+    val checkpointBase = s"$flinkStateUri/checkpoints/$flinkJobId"
+
+    when(mockStorageClient.listFiles(checkpointBase)).thenReturn(
+      Iterator(
+        s"$checkpointBase/chk-3/_metadata",
+        s"$checkpointBase/chk-7/_metadata",
+        s"$checkpointBase/chk-1/_metadata"
+      )
+    )
+
+    val result = S3StorageClient.resolveLatestCheckpointPath(mockStorageClient, flinkJobId, flinkStateUri)
+    assertEquals(Some(s"$checkpointBase/chk-7"), result)
+  }
+
+  it should "return None when no checkpoints exist" in {
+    val mockStorageClient = mock[StorageClient]
+    when(mockStorageClient.listFiles(any[String])).thenReturn(Iterator.empty)
+
+    val result = S3StorageClient.resolveLatestCheckpointPath(mockStorageClient, "abc123", "s3://my-bucket/flink-state")
+    assertEquals(None, result)
+  }
+
+  it should "return None when s3Client is not set" in {
+    val submitter = createSubmitter(mock[EmrServerlessClient], s3Client = None)
+    val result = submitter.getLatestCheckpointPath("abc123", "s3://my-bucket/flink-state")
+    assertEquals(None, result)
+  }
+
+  "getFlinkInternalJobId" should "delegate to flinkInternalJobIdFetchFn" in {
+    val mockClient = mock[EmrServerlessClient]
+    mockListApplications(mockClient, "app-123")
+    val flinkJobId = "flink-internal-uuid-456"
+    val submitter = new EmrServerlessSubmitter(
+      mockClient,
+      executionRoleArn = "arn:aws:iam::123456789012:role/EMRServerlessRole",
+      s3LogUri = "s3://my-bucket/logs/",
+      applicationName = "test-app",
+      flinkInternalJobIdFetchFn = _ => Some(flinkJobId)
+    )
+    val result = submitter.getFlinkInternalJobId("flink:app-123:my-deployment")
+    assertEquals(Some(flinkJobId), result)
+  }
+
+  it should "return None when fetch fn returns None" in {
+    val mockClient = mock[EmrServerlessClient]
+    mockListApplications(mockClient, "app-123")
+    val submitter = new EmrServerlessSubmitter(
+      mockClient,
+      executionRoleArn = "arn:aws:iam::123456789012:role/EMRServerlessRole",
+      s3LogUri = "s3://my-bucket/logs/",
+      applicationName = "test-app",
+      flinkInternalJobIdFetchFn = _ => None
+    )
+    val result = submitter.getFlinkInternalJobId("flink:app-123:my-deployment")
+    assertEquals(None, result)
   }
 
   /**

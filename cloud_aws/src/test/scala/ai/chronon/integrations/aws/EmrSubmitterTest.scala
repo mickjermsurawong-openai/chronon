@@ -3,9 +3,10 @@ package ai.chronon.integrations.aws
 import ai.chronon.api.JobStatusType
 import ai.chronon.api.ScalaJavaConversions.ListOps
 import ai.chronon.spark.submission.JobSubmitterConstants._
-import ai.chronon.spark.submission.{FlinkJob, SparkJob}
+import ai.chronon.spark.submission.{FlinkJob, SparkJob, StorageClient}
 import io.fabric8.kubernetes.client.Config
 import org.junit.Assert.assertEquals
+import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Mockito.{verify, when}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -472,6 +473,54 @@ class EmrSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     println(s"   View logs: kubectl logs -n zipline-flink -l app=$deploymentName")
 
     assert(deploymentName.nonEmpty, "Deployment name should not be empty")
+  }
+
+  it should "getLatestCheckpointPath returns the highest-numbered checkpoint" in {
+    val mockStorageClient = mock[StorageClient]
+    val flinkJobId = "abc123"
+    val flinkStateUri = "s3://my-bucket/flink-state"
+    val checkpointBase = s"$flinkStateUri/checkpoints/$flinkJobId"
+
+    when(mockStorageClient.listFiles(checkpointBase)).thenReturn(
+      Iterator(
+        s"$checkpointBase/chk-5/_metadata",
+        s"$checkpointBase/chk-1/_metadata",
+        s"$checkpointBase/chk-12/_metadata"
+      )
+    )
+
+    val result = S3StorageClient.resolveLatestCheckpointPath(mockStorageClient, flinkJobId, flinkStateUri)
+    assertEquals(Some(s"$checkpointBase/chk-12"), result)
+  }
+
+  it should "getLatestCheckpointPath returns None when no checkpoints exist" in {
+    val mockStorageClient = mock[StorageClient]
+    val flinkJobId = "abc123"
+    val flinkStateUri = "s3://my-bucket/flink-state"
+
+    when(mockStorageClient.listFiles(anyString())).thenReturn(Iterator.empty)
+
+    val result = S3StorageClient.resolveLatestCheckpointPath(mockStorageClient, flinkJobId, flinkStateUri)
+    assertEquals(None, result)
+  }
+
+  it should "getLatestCheckpointPath returns None when s3Client is not set" in {
+    val submitter = new EmrSubmitter("canary", mock[EmrClient], mock[Ec2Client], None, s3Client = None)
+    val result = submitter.getLatestCheckpointPath("abc123", "s3://my-bucket/flink-state")
+    assertEquals(None, result)
+  }
+
+  it should "getFlinkInternalJobId delegates to flinkInternalJobIdFetchFn" in {
+    val flinkJobId = "flink-internal-uuid-123"
+    val submitter = new EmrSubmitter(
+      "canary",
+      mock[EmrClient],
+      mock[Ec2Client],
+      None,
+      flinkInternalJobIdFetchFn = _ => Some(flinkJobId)
+    )
+    val result = submitter.getFlinkInternalJobId("emr:cluster:flink:my-deployment")
+    assertEquals(Some(flinkJobId), result)
   }
 
   it should "Used to iterate locally. Do not enable this in CI/CD!" ignore {

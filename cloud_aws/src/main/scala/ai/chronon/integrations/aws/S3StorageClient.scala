@@ -68,3 +68,29 @@ class S3StorageClient(s3Client: S3Client) extends StorageClient {
     else (stripped.substring(0, slashIdx), stripped.substring(slashIdx + 1))
   }
 }
+
+private[aws] object S3StorageClient {
+
+  /** Lists checkpoints under `{flinkStateUri}/checkpoints/{flinkInternalJobId}/chk-*` and
+    * returns the path to the highest-numbered checkpoint, or None if none exist.
+    */
+  def resolveLatestCheckpointPath(s3Client: S3Client,
+                                   flinkInternalJobId: String,
+                                   flinkStateUri: String): Option[String] =
+    resolveLatestCheckpointPath(new S3StorageClient(s3Client), flinkInternalJobId, flinkStateUri)
+
+  def resolveLatestCheckpointPath(storageClient: StorageClient,
+                                   flinkInternalJobId: String,
+                                   flinkStateUri: String): Option[String] = {
+    val jobCheckpointPath = s"$flinkStateUri/checkpoints/$flinkInternalJobId"
+    val latestCheckpoint = storageClient
+      .listFiles(jobCheckpointPath)
+      .filter(_.split("/").exists(_.startsWith("chk-")))
+      .map(_.split("/").find(_.startsWith("chk-")).get)
+      .toList
+      .distinct
+      .sortBy(_.substring(4).toInt)(Ordering.Int.reverse)
+      .headOption
+    latestCheckpoint.map(chk => s"$jobCheckpointPath/$chk")
+  }
+}

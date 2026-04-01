@@ -38,6 +38,10 @@ trait JobSubmitter {
 
   def getFlinkUrl(jobId: String): Option[String] = None
 
+  def getFlinkInternalJobId(jobId: String): Option[String] = None
+
+  def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = None
+
   // --- Lifecycle methods ---
 
   def close(): Unit = {}
