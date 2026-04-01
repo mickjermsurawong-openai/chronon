@@ -1,5 +1,6 @@
 # Batch Node Runner manual submission requires some credentials for open catalog.
 # This is for Azure + Polaris // Snow_OC
+set -x
 spark-submit \
       --class ai.chronon.spark.batch.BatchNodeRunner \
       --master "local[1]" \
@@ -15,7 +16,8 @@ spark-submit \
       --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
       --conf spark.kryo.registrator=ai.chronon.spark.submission.ChrononKryoRegistrator \
       --conf spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkCatalog \
-      --conf spark.sql.catalog.spark_catalog.credential=${OC_CRENDENTIAL-client_id:client_secret} \
+      --conf spark.chronon.table.format_provider.class=ai.chronon.integrations.cloud_azure.AzureFormatProvider \
+      --conf spark.sql.catalog.spark_catalog.credential=${OC_CREDENTIAL-client_id:client_secret} \
       --conf spark.sql.catalog.spark_catalog.header.X-Iceberg-Access-Delegation=vended-credentials \
       --conf spark.sql.catalog.spark_catalog.scope=PRINCIPAL_ROLE:${OC_ROLE-all} \
       --conf spark.sql.catalog.spark_catalog.type=rest \
@@ -29,7 +31,7 @@ spark-submit \
       --conf spark.zipline.label.zipline-version=latest \
       --conf spark.zipline.label.zipline_workflow_id=69138b3a-4027-416a-8dcb-b656029e7609 \
       out/cloud_azure/assembly.dest/out.jar \
-      --conf-path=azure_exports_dim_listings__0__staging \
+      --conf-path=azure_exports_dim_listings_pc__0__staging \
 	  --start-ds=2026-01-18 \
  	  --end-ds=2026-01-18 \
 	  --table-partitions-dataset=TABLE_PARTITIONS \
@@ -37,4 +39,7 @@ spark-submit \
 	  --online-class=ai.chronon.integrations.cloud_azure.AzureApiImpl \
 	  -ZAZURE_STORAGE_ACCOUNT_NAME=$AZ_STORAGE \
 	  -ZAZURE_REGION=$AZ_REGION \
-	  -ZENABLE_UPLOAD_CLIENTS=true
+	  -ZENABLE_UPLOAD_CLIENTS=true \
+      -ZCOSMOS_ENDPOINT=$COSMOS_ENDPOINT \
+      -ZCOSMOS_DATABASE=$COSMOS_DATABASE \
+      -ZCOSMOS_KEY=$COSMOS_KEY

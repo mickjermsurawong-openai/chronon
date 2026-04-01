@@ -39,15 +39,29 @@ case object Snowflake extends Format {
     throw new UnsupportedOperationException("Table creation is not supported for Snowflake format.")
   }
 
+  override def primaryPartitions(tableName: String,
+                                  partitionColumn: String,
+                                  partitionFilters: String,
+                                  subPartitionsFilter: Map[String, String] = Map.empty)(implicit
+      sparkSession: SparkSession): List[String] = {
+    val partitionFormat = sparkSession.conf.get("spark.chronon.partition.format", "yyyy-MM-dd")
+    val (database, schema, table) = parseTableName(tableName)
+
+    // Use the clustering key if one exists, otherwise fall back to the column requested by the caller
+    val effectiveColumn = getPartitionColumn(database, schema, table).getOrElse(partitionColumn)
+    snowflakeLogger.info(s"Using partition column '$effectiveColumn' for table $tableName")
+
+    queryDistinctPartitions(tableName, effectiveColumn, partitionFilters, partitionFormat)
+      .flatMap(_.get(effectiveColumn))
+  }
+
   override def partitions(tableName: String, partitionFilters: String)(implicit
       sparkSession: SparkSession): List[Map[String, String]] = {
     val defaultPartitionColumn = sparkSession.conf.get("spark.chronon.partition.column", "ds")
     val partitionFormat = sparkSession.conf.get("spark.chronon.partition.format", "yyyy-MM-dd")
 
-    // Parse table name to extract database and schema if provided
     val (database, schema, table) = parseTableName(tableName)
 
-    // Discover the partition column from the table's clustering key or fall back to default
     val partitionColumn = getPartitionColumn(database, schema, table).getOrElse(defaultPartitionColumn)
     snowflakeLogger.info(s"Using partition column '$partitionColumn' for table $tableName")
 
