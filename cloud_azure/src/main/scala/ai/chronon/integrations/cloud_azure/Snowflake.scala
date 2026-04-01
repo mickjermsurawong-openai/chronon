@@ -40,9 +40,9 @@ case object Snowflake extends Format {
   }
 
   override def primaryPartitions(tableName: String,
-                                  partitionColumn: String,
-                                  partitionFilters: String,
-                                  subPartitionsFilter: Map[String, String] = Map.empty)(implicit
+                                 partitionColumn: String,
+                                 partitionFilters: String,
+                                 subPartitionsFilter: Map[String, String] = Map.empty)(implicit
       sparkSession: SparkSession): List[String] = {
     val partitionFormat = sparkSession.conf.get("spark.chronon.partition.format", "yyyy-MM-dd")
     val (database, schema, table) = parseTableName(tableName)
