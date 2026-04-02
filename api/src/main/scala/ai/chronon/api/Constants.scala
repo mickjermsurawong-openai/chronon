@@ -31,6 +31,7 @@ object Constants {
   val UTF8 = "UTF-8"
   val TopicInvalidSuffix = "_invalid"
   val SemanticHashKey = "semantic_hash"
+  val JoinSemanticHashKey = "join_semantic_hash"
   val SchemaHash = "schema_hash"
   val BootstrapHash = "bootstrap_hash"
   val MatchedHashes = "matched_hashes"

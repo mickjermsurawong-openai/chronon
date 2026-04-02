@@ -24,6 +24,7 @@ import ai.chronon.api.ScalaJavaConversions._
 import ai.chronon.api.planner.JoinPlanner
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.catalog.TableUtils
+import com.google.gson.Gson
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions.{coalesce, col, udf}
@@ -37,20 +38,6 @@ import scala.jdk.CollectionConverters._
 object JoinUtils {
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
-  // Compute a single semantic hash for a Join config, matching what MonolithJoinPlanner produces.
-  // Strips metadata so that only semantically meaningful fields affect the hash.
-  private def computeSemanticHash(join: ai.chronon.api.Join): String = {
-    val semanticJoin = join.deepCopy()
-    semanticJoin.unsetMetaData()
-    Option(semanticJoin.joinParts).map(_.toScala).foreach { parts =>
-      parts.foreach(_.groupBy.unsetMetaData())
-    }
-    Option(semanticJoin.bootstrapParts).map(_.toScala).foreach { bootstrapParts =>
-      bootstrapParts.foreach(_.unsetMetaData())
-    }
-    semanticJoin.unsetOnlineExternalParts()
-    ThriftJsonCodec.hexDigest(semanticJoin)
-  }
   val set_add: UserDefinedFunction =
     udf((set: Seq[String], item: String) => {
       if (set == null && item == null) {
@@ -306,19 +293,14 @@ object JoinUtils {
   def tablesToRecompute(joinConf: ai.chronon.api.Join,
                         outputTable: String,
                         tableUtils: TableUtils): scala.Seq[String] = {
+    val gson = new Gson()
     (for (
       props <- tableUtils.getTableProperties(outputTable);
-      oldHash <- props.get(Constants.SemanticHashKey)
+      oldSemanticJson <- props.get(Constants.JoinSemanticHashKey);
+      oldSemanticHash = gson.fromJson(oldSemanticJson, classOf[java.util.HashMap[String, String]]).toScala
     ) yield {
-      val newHash = computeSemanticHash(joinConf)
-      logger.info(s"Comparing Hashes:\nNew: $newHash,\nOld: $oldHash")
-      if (oldHash == newHash) {
-        scala.Seq.empty[String]
-      } else {
-        // Hash changed — conservatively return all intermediate tables + output table
-        val partTables = joinConf.joinParts.toScala.map(joinConf.partOutputTable)
-        partTables :+ outputTable
-      }
+      logger.info(s"Comparing Hashes:\nNew: ${joinConf.semanticHash},\nOld: $oldSemanticHash")
+      joinConf.tablesToDrop(oldSemanticHash)
     }).getOrElse(scala.Seq.empty)
   }
 
@@ -328,11 +310,14 @@ object JoinUtils {
 
     try {
 
+      val gson = new Gson()
       val props = tableUtils.getTableProperties(outputTable)
-      val oldHash = props.flatMap(_.get(Constants.SemanticHashKey))
-      val newHash = computeSemanticHash(joinConf)
-      // With a single hash we can't distinguish left-only changes, so any change triggers recompute
-      oldHash.exists(_ != newHash)
+
+      val oldSemanticJson = props.flatMap(_.get(Constants.JoinSemanticHashKey))
+      val oldSemanticHash =
+        oldSemanticJson.map(json => gson.fromJson(json, classOf[java.util.HashMap[String, String]]).toScala)
+
+      oldSemanticHash.exists(joinConf.leftChanged)
 
     } catch {
 

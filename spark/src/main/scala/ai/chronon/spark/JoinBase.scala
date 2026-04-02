@@ -26,6 +26,7 @@ import ai.chronon.spark.catalog.TableUtils
 import ai.chronon.spark.Extensions._
 import ai.chronon.spark.JoinUtils.{coalescedJoin, leftDf, shouldRecomputeLeft, tablesToRecompute}
 import ai.chronon.spark.batch._
+import com.google.gson.Gson
 import ai.chronon.api.MetaData
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
@@ -57,8 +58,10 @@ abstract class JoinBase(val joinConfCloned: api.Join,
   protected val confTableProps: Map[String, String] =
     Option(joinMetaData.tableProps).getOrElse(Map.empty[String, String])
 
+  private val gson = new Gson()
   // Combine tableProperties set on conf with encoded Join
-  protected val tableProps: Map[String, String] = confTableProps
+  protected val tableProps: Map[String, String] =
+    confTableProps ++ Map(Constants.JoinSemanticHashKey -> gson.toJson(joinConfCloned.semanticHash.asJava))
 
   def joinWithLeft(leftDf: DataFrame, rightDf: DataFrame, joinPart: JoinPart): DataFrame = {
     val partLeftKeys = joinPart.rightToLeft.values.toArray
