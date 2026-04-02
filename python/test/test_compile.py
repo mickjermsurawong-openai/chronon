@@ -134,7 +134,6 @@ def _make_team_dict(namespace="test_namespace"):
     return {"test_team": team, "default": default_team}
 
 
-@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
 def test_update_metadata_propagates_namespace_to_groupby_join_source():
     """When a GroupBy uses a JoinSource whose Join has no outputNamespace,
     update_metadata should propagate the GroupBy's namespace to the embedded Join."""
@@ -156,7 +155,6 @@ def test_update_metadata_propagates_namespace_to_groupby_join_source():
     assert inner_join.metaData.outputNamespace == "gb_namespace"
 
 
-@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
 def test_update_metadata_does_not_overwrite_existing_join_source_namespace():
     """If the JoinSource's Join already has an outputNamespace, don't overwrite it."""
     inner_join = Join(
@@ -175,7 +173,6 @@ def test_update_metadata_does_not_overwrite_existing_join_source_namespace():
     assert inner_join.metaData.outputNamespace == "explicit_ns"
 
 
-@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
 def test_update_metadata_propagates_namespace_to_model_transforms_join_source():
     """Same propagation should work for ModelTransforms with JoinSource."""
     inner_join = Join(

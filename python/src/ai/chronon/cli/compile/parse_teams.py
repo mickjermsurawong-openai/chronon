@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional, Union
 
 from ai.chronon.cli.logger import get_logger
 from ai.chronon.cli.theme import console
-from ai.chronon.utils import normalize_sources
 from gen_thrift.api.ttypes import GroupBy, Join, JoinPart, MetaData, Model, ModelTransforms, Team
 from gen_thrift.common.ttypes import (
     ClusterConfigProperties,
@@ -98,6 +97,15 @@ def load_teams(conf_root: str, print: bool = True) -> Dict[str, Team]:
     return team_dict
 
 
+def _propagate_namespace_to_join_sources(sources, namespace):
+    """Set outputNamespace on any JoinSource's embedded Join that lacks one."""
+    if sources and namespace:
+        for src in sources:
+            if src.joinSource and src.joinSource.join and src.joinSource.join.metaData:
+                if not src.joinSource.join.metaData.outputNamespace:
+                    src.joinSource.join.metaData.outputNamespace = namespace
+
+
 def update_metadata(obj: Any, team_dict: Dict[str, Team]):
     assert obj is not None, "Cannot update metadata None object"
 
@@ -151,9 +159,9 @@ def update_metadata(obj: Any, team_dict: Dict[str, Team]):
             for m in obj.models or []:
                 set_join_part_or_models_metadata(m, model_transforms_namespace)
 
-        normalize_sources(obj.sources, model_transforms_namespace)
+        _propagate_namespace_to_join_sources(obj.sources, model_transforms_namespace)
     elif isinstance(obj, GroupBy):
-        normalize_sources(obj.sources, obj.metaData.outputNamespace)
+        _propagate_namespace_to_join_sources(obj.sources, obj.metaData.outputNamespace)
 
     if metadata.executionInfo is None:
         metadata.executionInfo = ExecutionInfo()
