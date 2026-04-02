@@ -339,7 +339,7 @@ def ModelTransforms(
                 utils.__set_name(model, ttypes.Model, "models")
 
     # Normalize all sources to ensure they are properly wrapped
-    normalized_sources = normalize_sources(sources)
+    normalized_sources = normalize_sources(sources, output_namespace)
 
     # Create metadata
     meta_data = ttypes.MetaData(

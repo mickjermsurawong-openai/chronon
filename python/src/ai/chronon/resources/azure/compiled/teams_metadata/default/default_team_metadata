@@ -1,0 +1,32 @@
+{
+  "executionInfo": {
+    "conf": {
+      "common": {
+        "spark.chronon.coalesce.factor": "10",
+        "spark.chronon.partition.column": "<partition-column-name>",
+        "spark.chronon.partition.format": "<date-format>",
+        "spark.chronon.table.format_provider.class": "ai.chronon.integrations.cloud_azure.AzureFormatProvider",
+        "spark.chronon.table_write.format": "iceberg",
+        "spark.default.parallelism": "10",
+        "spark.driver.cores": "1",
+        "spark.driver.memory": "1g",
+        "spark.executor.cores": "1",
+        "spark.executor.memory": "1g",
+        "spark.sql.shuffle.partitions": "10"
+      }
+    },
+    "env": {
+      "common": {
+        "ARTIFACT_PREFIX": "<customer-artifact-bucket>",
+        "CLOUD_PROVIDER": "azure",
+        "CUSTOMER_ID": "<customer_id>",
+        "FRONTEND_URL": "<frontend-url>",
+        "HUB_URL": "<hub-url>",
+        "SNOWFLAKE_JDBC_URL": "<jdbc-url>",
+        "SNOWFLAKE_VAULT_URI": "<vault-uri>",
+        "VERSION": "<version>",
+        "WAREHOUSE_PREFIX": "<customer-warehouse-prefix>"
+      }
+    }
+  }
+}
