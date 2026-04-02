@@ -3,10 +3,22 @@ import json
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
-from gen_thrift.api.ttypes import GroupBy, MetaData
+from gen_thrift.api.ttypes import (
+    EventSource,
+    GroupBy,
+    Join,
+    JoinPart,
+    JoinSource,
+    MetaData,
+    ModelTransforms,
+    Source,
+    Team,
+)
+from gen_thrift.common.ttypes import ExecutionInfo
 
 from ai.chronon.cli.compile import parse_configs
 from ai.chronon.cli.compile.compile_context import CompileContext
+from ai.chronon.cli.compile.parse_teams import update_metadata
 from ai.chronon.repo.compile import __compile, compile
 
 
@@ -111,3 +123,72 @@ def test_compile_with_json_format(canary):
 
     assert "results" in output_json, f"Output missing 'results' field: {output_json}"
     assert isinstance(output_json["results"], dict), f"'results' should be a dict, got: {type(output_json['results'])}"
+
+
+def _make_team_dict(namespace="test_namespace"):
+    """Helper to create a minimal team dict for update_metadata tests."""
+    team = Team(outputNamespace=namespace)
+    team.executionInfo = ExecutionInfo()
+    default_team = Team(outputNamespace="default_ns")
+    default_team.executionInfo = ExecutionInfo()
+    return {"test_team": team, "default": default_team}
+
+
+@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
+def test_update_metadata_propagates_namespace_to_groupby_join_source():
+    """When a GroupBy uses a JoinSource whose Join has no outputNamespace,
+    update_metadata should propagate the GroupBy's namespace to the embedded Join."""
+    inner_join = Join(
+        metaData=MetaData(name="test_team.parent_join", team="test_team"),
+        left=Source(events=EventSource(table="some_table")),
+    )
+    assert inner_join.metaData.outputNamespace is None
+
+    group_by = GroupBy(
+        sources=[Source(joinSource=JoinSource(join=inner_join))],
+        keyColumns=["user_id"],
+        metaData=MetaData(name="test_team.my_gb", team="test_team"),
+    )
+
+    update_metadata(group_by, _make_team_dict("gb_namespace"))
+
+    assert group_by.metaData.outputNamespace == "gb_namespace"
+    assert inner_join.metaData.outputNamespace == "gb_namespace"
+
+
+@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
+def test_update_metadata_does_not_overwrite_existing_join_source_namespace():
+    """If the JoinSource's Join already has an outputNamespace, don't overwrite it."""
+    inner_join = Join(
+        metaData=MetaData(name="test_team.parent_join", team="test_team", outputNamespace="explicit_ns"),
+        left=Source(events=EventSource(table="some_table")),
+    )
+
+    group_by = GroupBy(
+        sources=[Source(joinSource=JoinSource(join=inner_join))],
+        keyColumns=["user_id"],
+        metaData=MetaData(name="test_team.my_gb", team="test_team"),
+    )
+
+    update_metadata(group_by, _make_team_dict("gb_namespace"))
+
+    assert inner_join.metaData.outputNamespace == "explicit_ns"
+
+
+@patch('ai.chronon.utils.__set_name', new=lambda *args, **kwargs: None)
+def test_update_metadata_propagates_namespace_to_model_transforms_join_source():
+    """Same propagation should work for ModelTransforms with JoinSource."""
+    inner_join = Join(
+        metaData=MetaData(name="test_team.parent_join", team="test_team"),
+        left=Source(events=EventSource(table="some_table")),
+    )
+
+    mt = ModelTransforms(
+        sources=[Source(joinSource=JoinSource(join=inner_join))],
+        metaData=MetaData(name="test_team.my_mt", team="test_team"),
+    )
+
+    update_metadata(mt, _make_team_dict("mt_namespace"))
+
+    assert mt.metaData.outputNamespace == "mt_namespace"
+    assert inner_join.metaData.outputNamespace == "mt_namespace"
