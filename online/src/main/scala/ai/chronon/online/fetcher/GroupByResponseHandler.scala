@@ -317,8 +317,13 @@ class GroupByResponseHandler(fetchContext: FetchContext, metadataStore: Metadata
     }
 
     val aggregatorStartTime = System.currentTimeMillis()
-    val result =
-      servingInfo.megaTileMerger.merge(batchIr, dailyTileIrs, requestContext.queryTimeMs, servingInfo.batchEndTsMillis)
+    val result = servingInfo.megaTileMerger.merge(
+      batchIr,
+      dailyTileIrs,
+      requestContext.queryTimeMs,
+      servingInfo.batchEndTsMillis,
+      mergeNoBatchTailFromBatch = true
+    )
     requestContext.metricsContext.distribution("group_by.aggregator.latency.millis",
                                                System.currentTimeMillis() - aggregatorStartTime)
     result

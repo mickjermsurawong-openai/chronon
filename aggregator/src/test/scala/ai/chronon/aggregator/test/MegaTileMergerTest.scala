@@ -128,6 +128,71 @@ class MegaTileMergerTest extends AnyFlatSpec {
     assertEquals(5L, merged(1))
   }
 
+  it should "include batch tail for same-day 1d no-batch windows when streaming only covers after batchEnd" in {
+    val schema: Seq[(String, DataType)] = Seq("ts" -> LongType, "num" -> LongType)
+    val batchEnd = 1776297600000L // 2026-04-16T00:00:00Z
+    val queryTs = batchEnd + 16 * 3600 * 1000L // 2026-04-16T16:00:00Z
+    val todayStart = TsUtils.round(queryTs, DayMillis)
+    val oneHourMillis = new Window(1, TimeUnit.HOURS).millis
+    val aggregations: Seq[Aggregation] = Seq(
+      Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.DAYS))),
+      Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))
+    )
+    val batchRows = Array(
+      TestRow(batchEnd - 6 * 3600 * 1000L, 100L) // 2026-04-15T18:00:00Z, inside the query 1d window
+    )
+    val streamingRows = Array(
+      TestRow(batchEnd + 1 * 3600 * 1000L, 10L),
+      TestRow(batchEnd + 15 * 3600 * 1000L, 1L)
+    )
+    val allRows = batchRows ++ streamingRows
+
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val merger = new MegaTileMerger(megaTileAgg)
+    val onlineAgg = new SawtoothOnlineAggregator(batchEnd, aggregations, schema, tailBufferMillis = TailBufferMillis)
+
+    var batchIr = onlineAgg.init
+    batchRows.foreach(row => batchIr = onlineAgg.update(batchIr, row))
+    val finalBatchIr = onlineAgg.finalizeSnapshot(batchIr)
+
+    val tiles: Map[Long, mutable.Map[Long, Array[Any]]] =
+      megaTileAgg.activeTiers.map(hop => hop -> mutable.Map.empty[Long, Array[Any]]).toMap
+    streamingRows.foreach { row =>
+      megaTileAgg.tileStartsForEvent(row.ts).foreach {
+        case (hopSize, tileStart) =>
+          val ir = tiles(hopSize).getOrElseUpdate(tileStart, megaTileAgg.baseAggregator.init)
+          megaTileAgg.baseAggregator.update(ir, row)
+      }
+    }
+
+    val todayIr = megaTileAgg.buildMegaTileIr(tiles, now = queryTs, batchEnd = todayStart)
+    val dailyTileIrs: Seq[(Long, Array[Any])] = Seq(
+      todayStart -> todayIr,
+      (todayStart - DayMillis) -> null
+    )
+
+    val mega = merger.merge(finalBatchIr, dailyTileIrs, queryTs, batchEnd, mergeNoBatchTailFromBatch = true)
+    val megaWithoutBatch = merger.merge(null, dailyTileIrs, queryTs, batchEnd)
+    val naive = naiveAggregate(allRows, Array(queryTs), aggregations, schema).head
+    val vanillaTiles = mutable.Map.empty[Long, Array[Any]]
+    streamingRows.foreach { row =>
+      val tileStart = TsUtils.round(row.ts, oneHourMillis)
+      val ir = vanillaTiles.getOrElseUpdate(tileStart, megaTileAgg.windowedAggregator.init)
+      megaTileAgg.windowedAggregator.update(ir, row)
+    }
+    val vanilla = onlineAgg.lambdaAggregateFinalizedTiled(
+      finalBatchIr,
+      vanillaTiles.toSeq.map { case (tileStart, ir) => TiledIr(tileStart, ir) }.iterator,
+      queryTs
+    )
+
+    assertEquals("sanity: last 1d should include pre-batch tail plus streaming rows", 111L, naive(0))
+    assertEquals("sanity: vanilla tiled path includes the batch tail", naive(0), vanilla(0))
+    assertEquals("sanity: without batch, the mega daily entry is only the post-batch streaming portion", 11L, megaWithoutBatch(0))
+    assertEquals("1d no-batch path should include the pre-batch tail when the window crosses batchEnd", naive(0), mega(0))
+    assertEquals("control: batch-backed 7d still merges the batch tail", naive(1), mega(1))
+  }
+
   def naiveAggregate(allEvents: Array[TestRow],
                      queryTimes: Array[Long],
                      aggregations: Seq[Aggregation],

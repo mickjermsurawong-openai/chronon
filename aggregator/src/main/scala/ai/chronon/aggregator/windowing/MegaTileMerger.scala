@@ -9,7 +9,8 @@ import ai.chronon.api.TsUtils
   * no-batch windows, then combines them with batch IR into a finalized result.
   *
   * Per-column merge semantics:
-  *   - Small windows (≤ tailBuffer): self-contained in daily entry. Pick today, fall back to yesterday.
+  *   - Small windows (≤ tailBuffer): daily entry, plus optional batch tail when the request path knows
+  *     the streaming entries start at batchEnd.
   *   - Large windows (> tailBuffer): batch collapsed + streaming daily aggregates + tail hops.
   *   - Unwindowed: batch collapsed + streaming daily aggregates (no tail hops).
   */
@@ -58,8 +59,23 @@ class MegaTileMerger(megaTileAgg: MegaTileAggregator) {
             yesterdayIr: Array[Any],
             todayStart: Long,
             queryTs: Long,
-            batchEnd: Long): Array[Any] = {
-    merge(batchIr, Seq(todayStart -> todayIr, (todayStart - DayMillis) -> yesterdayIr), queryTs, batchEnd)
+            batchEnd: Long): Array[Any] =
+    merge(batchIr, todayIr, yesterdayIr, todayStart, queryTs, batchEnd, mergeNoBatchTailFromBatch = false)
+
+  def merge(batchIr: FinalBatchIr,
+            todayIr: Array[Any],
+            yesterdayIr: Array[Any],
+            todayStart: Long,
+            queryTs: Long,
+            batchEnd: Long,
+            mergeNoBatchTailFromBatch: Boolean): Array[Any] = {
+    merge(
+      batchIr,
+      Seq(todayStart -> todayIr, (todayStart - DayMillis) -> yesterdayIr),
+      queryTs,
+      batchEnd,
+      mergeNoBatchTailFromBatch
+    )
   }
 
   /** Merge batch IR + N daily streaming entries into a finalized result.
@@ -70,7 +86,14 @@ class MegaTileMerger(megaTileAgg: MegaTileAggregator) {
     * @param batchEnd     The batch upload boundary timestamp.
     * @return Finalized feature values.
     */
-  def merge(batchIr: FinalBatchIr, dailyTileIrs: Seq[(Long, Array[Any])], queryTs: Long, batchEnd: Long): Array[Any] = {
+  def merge(batchIr: FinalBatchIr, dailyTileIrs: Seq[(Long, Array[Any])], queryTs: Long, batchEnd: Long): Array[Any] =
+    merge(batchIr, dailyTileIrs, queryTs, batchEnd, mergeNoBatchTailFromBatch = false)
+
+  def merge(batchIr: FinalBatchIr,
+            dailyTileIrs: Seq[(Long, Array[Any])],
+            queryTs: Long,
+            batchEnd: Long,
+            mergeNoBatchTailFromBatch: Boolean): Array[Any] = {
 
     val resultIr =
       if (batchIr != null) windowedAggregator.clone(batchIr.collapsed)
@@ -82,9 +105,8 @@ class MegaTileMerger(megaTileAgg: MegaTileAggregator) {
     var col = 0
     while (col < windowedAggregator.length) {
       if (isNoBatch(col)) {
-        // Small window: self-contained in daily entry, ignore batch.
         // Fall back to an older day only if the newer entry is missing entirely,
-        // not if a newer entry exists but this column value is null.
+        // not if a newer entry exists but this column value is null (no events in window).
         val newestAvailableIr = nonNullDailyTileIrs.collectFirst {
           case (dayStart, dayIr) if dayStart >= oldestNoBatchDayStart => dayIr
         }.orNull
@@ -101,8 +123,11 @@ class MegaTileMerger(megaTileAgg: MegaTileAggregator) {
       col += 1
     }
 
-    // Tail hops for large windowed columns (skips small + unwindowed)
+    // Tail hops for large windowed columns, plus optional small-window batch tails for post-batch entries.
     if (batchIr != null) {
+      if (mergeNoBatchTailFromBatch) {
+        megaTileAgg.mergeTailHopsForNoBatchColumnsCrossingBatchEnd(resultIr, queryTs, batchEnd, batchIr)
+      }
       megaTileAgg.mergeTailHopsForBatchColumns(resultIr, queryTs, batchEnd, batchIr)
     }
 
