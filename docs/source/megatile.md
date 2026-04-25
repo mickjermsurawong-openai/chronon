@@ -110,6 +110,11 @@ Important details that are easy to mix up:
   with wall clock.
 - Output buffering is write coalescing only. It uses PT timers to avoid emitting on every event or
   eviction; it does not change event-time mutation or as-of selection.
+- MegaTile buffered emission defaults to `buffering_output_policy=dirty_buffer_with_jitter`, where
+  the first dirty row schedules `processingTs + buffering_output_time_millis` plus optional
+  `buffering_output_jitter_millis`. `wall_clock_cadence` instead uses a stable per-key wall-clock
+  phase in `Live`/`SparseKeyLag`, while `NoWatermark` and `ActiveCatchup` keep the dirty-buffered
+  fallback so startup and replay are bounded by the configured buffer.
 
 The code-order step-by-step walkthrough lives in `MegaTileProcessFunction.scala`.
 
@@ -153,8 +158,9 @@ events from prematurely rotating state.
 - Event ingestion calls `advanceWatermark` with the current Flink watermark before applying the row.
 - Eviction timers call `advanceWatermark` with the selected eviction time: watermark-hop time in
   `ActiveCatchup`, and PT in `NoWatermark`, `SparseKeyLag`, and `Live`.
-- Before an adjacent one-day roll, `MegaTileProcessFunction` emits any dirty today row under the
-  previous day key so buffered small-window state is not lost.
+- Before an adjacent one-day roll, `MegaTileProcessFunction` emits or buffers any dirty today row
+  under the previous day key so buffered small-window state is not lost. With
+  `wall_clock_cadence`, a pending pre-rollover row is preserved until the next cadence emit timer.
 
 ```
 transitionDay = round(dayTransitionTs, DayMillis)
@@ -341,8 +347,8 @@ Tests at five layers, with aggregator/codec tests comparing against NaiveAggrega
    events, and eviction (9 tests)
 4. **MegaTileCodecRoundTripTest** — serde round-trips via SerdeTileStore + key switch (5 tests)
 5. **MegaTileProcessFunctionTest** — Flink keyed process-function lifecycle coverage for Live,
-   ActiveCatchup, SparseKeyLag, buffered emit jitter, timer restore, malformed rows, and UTC day
-   boundaries (22 tests)
+   ActiveCatchup, SparseKeyLag, buffered emit jitter, wall-clock cadence, timer restore, malformed
+   rows, and UTC day boundaries
 
 Windows tested: 6h, 1d, 47h, 2d, 49h, 3d, 7d.
 Aggregation types: SUM, COUNT, AVERAGE, MIN, MAX, LAST, FIRST.

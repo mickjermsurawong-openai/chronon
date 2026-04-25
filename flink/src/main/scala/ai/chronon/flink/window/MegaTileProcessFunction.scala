@@ -18,6 +18,30 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import scala.util.Try
 
+sealed trait MegaTileEmissionPolicy extends Serializable
+
+object MegaTileEmissionPolicy {
+
+  case object DirtyBufferWithJitter extends MegaTileEmissionPolicy
+
+  case object WallClockCadence extends MegaTileEmissionPolicy
+
+  val DirtyBufferWithJitterName = "dirty_buffer_with_jitter"
+  val WallClockCadenceName = "wall_clock_cadence"
+  val Default: MegaTileEmissionPolicy = DirtyBufferWithJitter
+  val DefaultName: String = DirtyBufferWithJitterName
+
+  def fromString(raw: String): MegaTileEmissionPolicy =
+    Option(raw).map(_.trim.toLowerCase) match {
+      case Some(DirtyBufferWithJitterName) => DirtyBufferWithJitter
+      case Some(WallClockCadenceName)      => WallClockCadence
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Unsupported MegaTile emission policy '$raw'. Expected one of: " +
+            s"$DirtyBufferWithJitterName, $WallClockCadenceName")
+    }
+}
+
 /** Flink KeyedProcessFunction that maintains per-entity mega tile state.
   * Delegates aggregation logic to MegaTileStreamProcessor and uses FlinkTileStore for keyed state.
   * See docs/source/megatile.md for the high-level clock/mode mental model.
@@ -32,8 +56,8 @@ import scala.util.Try
   *      key's state.
   *
   * 2. Roll day state using the Flink watermark, not this event's timestamp or processing time (PT).
-  *    If the watermark crosses midnight while today's row is still buffered, emit the old-day row
-  *    first.
+  *    If the watermark crosses midnight while today's row is still buffered, emit or buffer the
+  *    old-day row first.
   *    - Why watermark: if one bad/future event arrives with `eventTs = tomorrow 00:01` and we
   *      rotated day state from that event timestamp, then later valid events from `today 23:50`
   *      would get misclassified into yesterday or dropped. The watermark means the stream has
@@ -65,16 +89,18 @@ import scala.util.Try
   *    - Emission's job is write coalescing only: if today/yesterday is dirty, serialize the current
   *      row and write it downstream. The first dirty update arms the timer; later updates only set
   *      dirty bits so hot keys do not emit once per event.
-  *    - Example: with `bufferingOutputTimeMillis = 1000`, 100 events in one second produce one emit
-  *      at `processingTs + 1s + stable key jitter`, not 100 downstream writes.
+  *    - `DirtyBufferWithJitter` schedules relative to the first dirty write. `WallClockCadence`
+  *      uses a stable key phase in live-like modes, with dirty-buffered fallback before the first
+  *      watermark and during active catchup.
   *
   * Timer path (`onTimer`)
   * 7. Dispatch each PT callback into exactly one branch: evict+emit collision, evict-only, or
   *    emit-only.
   *
-  * 8. On an eviction timer, choose the eviction as-of timestamp, maybe emit today's pre-rollover
-  *    row, roll day state, drop expired small-window tiles, rebuild today's small-window state,
-  *    mark dirty state, and re-arm the eviction heartbeat while small-window tiles still exist.
+  * 8. On an eviction timer, choose the eviction as-of timestamp, maybe emit or buffer today's
+  *    pre-rollover row, roll day state, drop expired small-window tiles, rebuild today's
+  *    small-window state, mark dirty state, and re-arm the eviction heartbeat while small-window
+  *    tiles still exist.
   *    - During replay lag, eviction uses the next watermark hop while this key is actively receiving
   *      events; otherwise eviction uses PT.
   *    - Example: if PT is Apr 2 11:00 but replayed events are from Mar 31 11:00, eviction should
@@ -85,14 +111,16 @@ import scala.util.Try
   *      like replay. If upstream stops for a key, that same branch keeps PT eviction running so
   *      values still decay with no new events.
   *
-  * 9. On an emit timer, serialize and emit each dirty day row once, then clear its dirty bit.
+  * 9. On an emit timer, live cadence may roll day from PT first. Then emit each pending or dirty
+  *    day row once and clear its dirty bit or pending buffer.
   */
 class MegaTileProcessFunction(
     groupBy: GroupBy,
     inputSchema: Seq[(String, DataType)],
     enableDebug: Boolean = false,
     bufferingOutputTimeMillis: Long = 0L,
-    bufferingOutputJitterMillis: Long = 0L
+    bufferingOutputJitterMillis: Long = 0L,
+    emissionPolicy: MegaTileEmissionPolicy = MegaTileEmissionPolicy.Default
 ) extends KeyedProcessFunction[java.util.List[Any], ProjectedEvent, TimestampedTile] {
 
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
@@ -114,6 +142,7 @@ class MegaTileProcessFunction(
   private var largeYesterdayIrState: ValueState[Array[Byte]] = _
   private var currentDayStartState: ValueState[java.lang.Long] = _
   private var earliestTileStartState: ValueState[java.lang.Long] = _
+  private var pendingDayRollEmitTileBytesState: MapState[java.lang.Long, Array[Byte]] = _
 
   private var nextEvictPtTimerState: ValueState[java.lang.Long] = _
   private var nextEmitPtTimerState: ValueState[java.lang.Long] = _
@@ -129,6 +158,14 @@ class MegaTileProcessFunction(
       .addGroup("feature_group", groupBy.getMetaData.getName)
     eventProcessingErrorCounter = metricsGroup.counter("event_processing_error")
 
+    if (emissionPolicy == MegaTileEmissionPolicy.WallClockCadence &&
+        bufferingOutputJitterMillis > 0L) {
+      logger.warn(
+        s"MegaTile emission policy ${MegaTileEmissionPolicy.WallClockCadenceName} ignores " +
+          s"bufferingOutputJitterMillis=$bufferingOutputJitterMillis for " +
+          s"groupBy=${groupBy.getMetaData.getName}; cadence spread comes from wall-clock phase")
+    }
+
     tileState = getRuntimeContext.getMapState(
       new MapStateDescriptor[String, Array[Byte]]("mega-tile-tiles", classOf[String], classOf[Array[Byte]]))
     megaTileIrState =
@@ -141,6 +178,11 @@ class MegaTileProcessFunction(
       new ValueStateDescriptor[java.lang.Long]("mega-tile-day-start", classOf[java.lang.Long]))
     earliestTileStartState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("mega-tile-earliest-tile", classOf[java.lang.Long]))
+    pendingDayRollEmitTileBytesState = getRuntimeContext.getMapState(
+      new MapStateDescriptor[java.lang.Long, Array[Byte]](
+        "mega-tile-pending-emit-tile-bytes",
+        classOf[java.lang.Long],
+        classOf[Array[Byte]]))
     nextEvictPtTimerState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("mega-tile-next-evict-pt-timer", classOf[java.lang.Long]))
     nextEmitPtTimerState = getRuntimeContext.getState(
@@ -198,10 +240,10 @@ class MegaTileProcessFunction(
 
       // Step 2. Event ingestion rolls day state from watermark, not processing time, so a brief
       // source lag near midnight does not move `currentDayStart` too early.
-      emitTodayIfNeededThenRollDay(watermark, ctx.getCurrentKey, event.startProcessingTimeMillis, out)
+      emitOrBufferTodayThenDayRoll(watermark, ctx.getCurrentKey, event.startProcessingTimeMillis, out)
       if (isOlderThanYesterdayForCurrentDay(tsMills)) {
         scheduleEvictTimerIfNeeded(timerService, processingTs)
-        emitDirtyOrSchedule(event.startProcessingTimeMillis, processingTs, timerService, out)
+        emitDirtyOrSchedule(event.startProcessingTimeMillis, processingTs, watermark, timerService, out)
         return
       }
 
@@ -215,7 +257,7 @@ class MegaTileProcessFunction(
       // Step 5.
       scheduleEvictTimerIfNeeded(timerService, processingTs)
       // Step 6.
-      emitDirtyOrSchedule(event.startProcessingTimeMillis, processingTs, timerService, out)
+      emitDirtyOrSchedule(event.startProcessingTimeMillis, processingTs, watermark, timerService, out)
     } catch {
       case e: Exception =>
         logger.error(s"Error processing mega tile event for groupBy=${groupBy.getMetaData.getName}", e)
@@ -252,15 +294,15 @@ class MegaTileProcessFunction(
         // Step 7 and Step 8.
         runEvictionTimer(ctx.getCurrentKey, timestamp, processingTs, watermark, timerService, out)
         // Step 9: this timestamp is also the buffered emit timer, so emit once after Step 8 rebuilt state.
-        emitDirtyMegaTiles(ctx.getCurrentKey, processingTs, out)
+        runEmitTimer(ctx.getCurrentKey, timerService, processingTs, watermark, out)
       } else if (isEvictTimer) {
         // Step 7 and Step 8.
         runEvictionTimer(ctx.getCurrentKey, timestamp, processingTs, watermark, timerService, out)
         // Step 9: eviction changed state; if buffering is enabled, arm one emit timer.
-        emitDirtyOrSchedule(processingTs, processingTs, timerService, out)
+        emitDirtyOrSchedule(processingTs, processingTs, watermark, timerService, out)
       } else if (isEmitTimer) {
         // Step 7 and Step 9.
-        emitDirtyMegaTiles(ctx.getCurrentKey, processingTs, out)
+        runEmitTimer(ctx.getCurrentKey, timerService, processingTs, watermark, out)
       }
     } catch {
       case e: Exception =>
@@ -287,6 +329,15 @@ class MegaTileProcessFunction(
   private def isYesterdayDirty: Boolean =
     Option(yesterdayDirtyState.value()).exists(_.booleanValue())
 
+  private def hasPendingDayRollEmit: Boolean =
+    !pendingDayRollEmitTileBytesState.isEmpty
+
+  private def hasDirtyEmitState: Boolean =
+    isTodayDirty || isYesterdayDirty || hasPendingDayRollEmit
+
+  private def shouldKeepLiveCadenceTimer: Boolean =
+    hasDirtyEmitState || hasActiveSmallWindowState
+
   private def markDirtyState(hasTodayUpdate: Boolean, hasYesterdayUpdate: Boolean): Unit = {
     if (hasTodayUpdate) todayDirtyState.update(java.lang.Boolean.TRUE)
     if (hasYesterdayUpdate) yesterdayDirtyState.update(java.lang.Boolean.TRUE)
@@ -300,7 +351,7 @@ class MegaTileProcessFunction(
                                out: Collector[TimestampedTile]): Unit = {
     val mode = currentMode(processingTs, watermark)
     val evictionTime = evictionTimeForProcessingTimer(mode, processingTs, watermark)
-    emitTodayIfNeededThenRollDay(evictionTime, currentKey, processingTs, out)
+    emitOrBufferTodayThenDayRoll(evictionTime, currentKey, processingTs, out)
 
     val result = processor.onEviction(evictionTime)
     markDirtyState(result.todayEntry != null, hasYesterdayUpdate = false)
@@ -329,7 +380,7 @@ class MegaTileProcessFunction(
     * Emitting under `previousDayStart` preserves the logical daily key across rollover; `MegaTileAvroCodecFn`
     * uses that day-start timestamp when constructing the external `TileKey`.
     */
-  private def emitTodayIfNeededThenRollDay(dayTransitionTs: Long,
+  private def emitOrBufferTodayThenDayRoll(dayTransitionTs: Long,
                                            keys: java.util.List[Any],
                                            processingTsMillis: Long,
                                            out: Collector[TimestampedTile]): Unit = {
@@ -340,7 +391,7 @@ class MegaTileProcessFunction(
         isTodayDirty &&
         TsUtils.round(dayTransitionTs, processor.DayMillis) == nextDayStart
     if (shouldEmitPreviousTodayRow) {
-      emitMegaTileIfPresent(keys, processor.packTodayEntry(), previousDayStart, processingTsMillis, out)
+      emitOrBufferDayRollMegaTile(keys, processor.packTodayEntry(), previousDayStart, processingTsMillis, out)
       todayDirtyState.clear()
     }
 
@@ -356,6 +407,12 @@ class MegaTileProcessFunction(
   private case object SparseKeyLag extends Mode
 
   private case object Live extends Mode
+
+  sealed private trait EmitTimerScheduling
+
+  private case class DirtyBufferedEmitTimer(maxJitterMillis: Long) extends EmitTimerScheduling
+
+  private case object LiveCadenceEmitTimer extends EmitTimerScheduling
 
   private def currentMode(processingTs: Long, watermark: Long): Mode = {
     val lastEventProcessingTs =
@@ -416,26 +473,76 @@ class MegaTileProcessFunction(
 
   private def emitDirtyOrSchedule(outputProcessingTsMillis: Long,
                                   processingTs: Long,
+                                  watermark: Long,
                                   timerService: TimerService,
                                   out: Collector[TimestampedTile]): Unit = {
     if (!bufferingEnabled) {
       emitDirtyMegaTiles(lastKey, outputProcessingTsMillis, out)
       return
     }
-    scheduleEmitTimerIfNeeded(timerService, processingTs)
+    val scheduling = emitTimerSchedulingFor(currentMode(processingTs, watermark))
+    scheduleEmitTimerIfNeeded(timerService, processingTs, scheduling)
   }
 
-  private def scheduleEmitTimerIfNeeded(timerService: TimerService, processingTs: Long): Unit = {
-    if (!isTodayDirty && !isYesterdayDirty) return
+  private def scheduleEmitTimerIfNeeded(timerService: TimerService,
+                                        processingTs: Long,
+                                        scheduling: EmitTimerScheduling): Unit =
+    scheduling match {
+      case DirtyBufferedEmitTimer(maxJitterMillis) =>
+        scheduleDirtyBufferedEmitTimerIfNeeded(timerService, processingTs, maxJitterMillis)
+      case LiveCadenceEmitTimer =>
+        if (shouldKeepLiveCadenceTimer) {
+          scheduleLiveCadenceTimer(timerService, processingTs)
+        }
+    }
 
+  private def emitTimerSchedulingFor(mode: Mode): EmitTimerScheduling =
+    emissionPolicy match {
+      case MegaTileEmissionPolicy.DirtyBufferWithJitter =>
+        DirtyBufferedEmitTimer(bufferingOutputJitterMillis)
+      case MegaTileEmissionPolicy.WallClockCadence =>
+        mode match {
+          case NoWatermark | ActiveCatchup =>
+            DirtyBufferedEmitTimer(maxJitterMillis = 0L)
+          case SparseKeyLag | Live =>
+            LiveCadenceEmitTimer
+        }
+    }
+
+  private def scheduleLiveCadenceTimer(timerService: TimerService, processingTs: Long): Unit = {
     val current = nextEmitPtTimerState.value()
     if (current == null) {
-      val timestamp =
-        processingTs + bufferingOutputTimeMillis + stableJitterMillis(lastKey, bufferingOutputJitterMillis)
+      val timestamp = nextKeyWallClockEmitTimer(lastKey, processingTs)
       timerService.registerProcessingTimeTimer(timestamp)
       nextEmitPtTimerState.update(timestamp)
     }
   }
+
+  private def scheduleDirtyBufferedEmitTimerIfNeeded(timerService: TimerService,
+                                                     processingTs: Long,
+                                                     maxJitterMillis: Long): Unit = {
+    if (!hasDirtyEmitState) return
+
+    val current = nextEmitPtTimerState.value()
+    if (current == null) {
+      val timestamp =
+        processingTs + bufferingOutputTimeMillis + stableJitterMillis(lastKey, maxJitterMillis)
+      timerService.registerProcessingTimeTimer(timestamp)
+      nextEmitPtTimerState.update(timestamp)
+    }
+  }
+
+  private def nextKeyWallClockEmitTimer(key: java.util.List[Any], processingTs: Long): Long = {
+    val phase = stablePhaseMillis(key, bufferingOutputTimeMillis)
+    val elapsedSincePhase = Math.floorMod(processingTs - phase, bufferingOutputTimeMillis)
+    val delay =
+      if (elapsedSincePhase == 0L) bufferingOutputTimeMillis
+      else bufferingOutputTimeMillis - elapsedSincePhase
+    processingTs + delay
+  }
+
+  private def stablePhaseMillis(key: java.util.List[Any], cadenceMillis: Long): Long =
+    Math.floorMod((groupBy.getMetaData.getName :: key.toScala).hashCode().toLong, cadenceMillis)
 
   private def stableJitterMillis(key: java.util.List[Any], maxJitterMillis: Long): Long =
     if (maxJitterMillis <= 0L) 0L
@@ -459,32 +566,113 @@ class MegaTileProcessFunction(
     current != null && current.longValue() == timestamp
   }
 
+  private def runEmitTimer(keys: java.util.List[Any],
+                           timerService: TimerService,
+                           processingTsMillis: Long,
+                           watermark: Long,
+                           out: Collector[TimestampedTile]): Unit = {
+    val mode = currentMode(processingTsMillis, watermark)
+    val scheduling = emitTimerSchedulingFor(mode)
+    scheduling match {
+      case LiveCadenceEmitTimer =>
+        // Large-window-only groupBys have no eviction timer; live cadence supplies their PT day roll.
+        emitOrBufferTodayThenDayRoll(processingTsMillis, keys, processingTsMillis, out)
+      case DirtyBufferedEmitTimer(_) =>
+    }
+    emitDirtyMegaTiles(keys, processingTsMillis, out)
+    scheduleEmitTimerIfNeeded(timerService, processingTsMillis, scheduling)
+  }
+
   private def emitDirtyMegaTiles(keys: java.util.List[Any],
                                  processingTsMillis: Long,
                                  out: Collector[TimestampedTile]): Unit = {
     val currentDayStart = flinkStore.getCurrentDayStart
+    emitPendingDayRollMegaTile(keys, currentDayStart, processingTsMillis, out)
     if (isTodayDirty) {
-      emitMegaTileIfPresent(keys, processor.packTodayEntry(), currentDayStart, processingTsMillis, out)
+      emitMegaTile(keys, processor.packTodayEntry(), currentDayStart, processingTsMillis, out)
       todayDirtyState.clear()
     }
     if (isYesterdayDirty) {
-      emitMegaTileIfPresent(keys,
-                            processor.packYesterdayEntry(),
-                            currentDayStart - processor.DayMillis,
-                            processingTsMillis,
-                            out)
+      emitMegaTile(keys,
+                   processor.packYesterdayEntry(),
+                   currentDayStart - processor.DayMillis,
+                   processingTsMillis,
+                   out)
       yesterdayDirtyState.clear()
     }
   }
 
-  private def emitMegaTileIfPresent(keys: java.util.List[Any],
-                                    entry: Array[Any],
-                                    dayStartMillis: Long,
-                                    processingTsMillis: Long,
-                                    out: Collector[TimestampedTile]): Unit = {
-    if (entry == null) return
-    out.collect(new TimestampedTile(keys, megaTileCodec.encode(entry), dayStartMillis, processingTsMillis))
+  private def emitPendingDayRollMegaTile(keys: java.util.List[Any],
+                                         currentDayStart: Long,
+                                         processingTsMillis: Long,
+                                         out: Collector[TimestampedTile]): Unit = {
+    val pendingDayRollEmit =
+      if (pendingDayRollEmitTileBytesState.isEmpty) {
+        None
+      } else {
+        val iterator = pendingDayRollEmitTileBytesState.keys().iterator()
+        val dayStartMillis = iterator.next().longValue()
+        if (iterator.hasNext) {
+          logger.warn(
+            s"MegaTile expected at most one pending day-roll emit row for " +
+              s"groupBy=${groupBy.getMetaData.getName}, key=$lastKey; dropping pending rows")
+          None
+        } else {
+          Some(dayStartMillis -> pendingDayRollEmitTileBytesState.get(dayStartMillis))
+        }
+      }
+
+    pendingDayRollEmit match {
+      case Some((pendingDayStart, tileBytes)) =>
+        val todayStart = currentDayStart
+        val yesterdayStart = currentDayStart - processor.DayMillis
+        val pendingIsRetainedDay =
+          pendingDayStart == todayStart || pendingDayStart == yesterdayStart
+        val pendingHasFresherDirtyRow =
+          (pendingDayStart == todayStart && isTodayDirty) ||
+            (pendingDayStart == yesterdayStart && isYesterdayDirty)
+
+        if (pendingIsRetainedDay && !pendingHasFresherDirtyRow) {
+          emitMegaTileBytes(keys, tileBytes, pendingDayStart, processingTsMillis, out)
+        }
+      case None =>
+    }
+    pendingDayRollEmitTileBytesState.clear()
   }
+
+  private def emitOrBufferDayRollMegaTile(keys: java.util.List[Any],
+                                          entry: Array[Any],
+                                          dayStartMillis: Long,
+                                          processingTsMillis: Long,
+                                          out: Collector[TimestampedTile]): Unit = {
+    if (!bufferingEnabled || emissionPolicy == MegaTileEmissionPolicy.DirtyBufferWithJitter) {
+      emitMegaTile(keys, entry, dayStartMillis, processingTsMillis, out)
+      return
+    }
+
+    if (hasPendingDayRollEmit) {
+      emitPendingDayRollMegaTile(keys, dayStartMillis, processingTsMillis, out)
+    }
+    if (entry != null) {
+      pendingDayRollEmitTileBytesState.put(dayStartMillis, megaTileCodec.encode(entry))
+    }
+  }
+
+  private def emitMegaTile(keys: java.util.List[Any],
+                           entry: Array[Any],
+                           dayStartMillis: Long,
+                           processingTsMillis: Long,
+                           out: Collector[TimestampedTile]): Unit = {
+    if (entry == null) return
+    emitMegaTileBytes(keys, megaTileCodec.encode(entry), dayStartMillis, processingTsMillis, out)
+  }
+
+  private def emitMegaTileBytes(keys: java.util.List[Any],
+                                tileBytes: Array[Byte],
+                                dayStartMillis: Long,
+                                processingTsMillis: Long,
+                                out: Collector[TimestampedTile]): Unit =
+    out.collect(new TimestampedTile(keys, tileBytes, dayStartMillis, processingTsMillis))
 }
 
 /** TileStore backed by Flink's keyed MapState/ValueState.

@@ -8,6 +8,7 @@ import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.FlinkSource
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
+import ai.chronon.flink.window.MegaTileEmissionPolicy
 import ai.chronon.online.{Api, GroupByServingInfoParsed, TopicInfo}
 
 import java.util.concurrent.TimeUnit
@@ -70,6 +71,11 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
     FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo)
   private val bufferingOutputJitterMillis =
     FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+  private val bufferingOutputPolicy =
+    FlinkUtils
+      .getProperty("buffering_output_policy", props, topicInfo)
+      .map(MegaTileEmissionPolicy.fromString)
+      .getOrElse(MegaTileEmissionPolicy.Default)
 
   /** Build the tiled version of the Flink GroupBy job that chains features using a JoinSource.
     *  The operators are structured as follows:
@@ -100,7 +106,8 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
                        kvStoreCapacity,
                        enableDebug,
                        bufferingOutputTimeMillis,
-                       bufferingOutputJitterMillis)
+                       bufferingOutputJitterMillis,
+                       bufferingOutputPolicy)
   }
 
   /** Build the source → watermark → enrichment → query transform pipeline.
