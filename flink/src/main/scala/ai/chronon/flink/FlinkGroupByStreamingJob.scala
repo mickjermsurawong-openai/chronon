@@ -6,6 +6,7 @@ import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.FlinkSource
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
+import ai.chronon.flink.window.MegaTileEmissionPolicy
 import ai.chronon.online.{GroupByServingInfoParsed, TopicInfo}
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
@@ -49,6 +50,11 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
     FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo)
   private val bufferingOutputJitterMillis =
     FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+  private val bufferingOutputPolicy =
+    FlinkUtils
+      .getProperty("buffering_output_policy", props, topicInfo)
+      .map(MegaTileEmissionPolicy.fromString)
+      .getOrElse(MegaTileEmissionPolicy.Default)
 
   // The source of our Flink application is a  topic
   val topic: String = groupByServingInfoParsed.groupBy.streamingSource.get.topic
@@ -137,7 +143,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
                        kvStoreCapacity,
                        enableDebug,
                        bufferingOutputTimeMillis,
-                       bufferingOutputJitterMillis)
+                       bufferingOutputJitterMillis,
+                       bufferingOutputPolicy)
   }
 
   private def buildSourceStream(env: StreamExecutionEnvironment): DataStream[ProjectedEvent] = {

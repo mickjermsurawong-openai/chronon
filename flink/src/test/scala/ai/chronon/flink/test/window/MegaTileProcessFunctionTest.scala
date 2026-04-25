@@ -5,7 +5,7 @@ import ai.chronon.api.Extensions.WindowOps
 import ai.chronon.flink.FlinkJob
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.TimestampedTile
-import ai.chronon.flink.window.MegaTileProcessFunction
+import ai.chronon.flink.window.{MegaTileEmissionPolicy, MegaTileProcessFunction}
 import ai.chronon.online.MegaTileCodec
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.api.java.functions.KeySelector
@@ -288,11 +288,10 @@ class MegaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       driver.processEvent("gen_replay", "2025-07-21T10:31:00Z", "user_replay_2")
       driver.drainNewOutputs().last.values shouldEqual windowValues(2L, 2L, 2L)
 
-      // Once the key is idle for more than one hop, sparse-key fallback rolls to the PT day.
+      // Once the key is idle for more than one hop, sparse-key fallback rolls to the PT day in
+      // state. The rebuild does not need to publish a row when the packed value is unchanged.
       driver.setProcessingTime("2025-07-23T10:50:00Z")
-      val idleFallback = driver.drainNewOutputs().last
-      idleFallback.dayStartMillis shouldEqual dayStart("2025-07-23T00:00:00Z")
-      idleFallback.values shouldEqual windowValues(null, null, null)
+      driver.drainNewOutputs() shouldBe empty
     }
   }
 
@@ -374,7 +373,7 @@ class MegaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       // In replay mode, the small-window as-of timestamp follows the watermark hop: 1d can include
       // the duplicate boundary row, while 1h must not double-count after the Jul23 day roll.
       outputs.find(_.dayStartMillis == dayStart("2025-07-23T00:00:00Z")).map(_.values) shouldEqual
-        Some(windowValues(1L, 2L, null))
+        Some(windowValues(null, 2L, null))
       outputs.find(_.dayStartMillis == dayStart("2025-07-22T00:00:00Z")).map(_.values) shouldEqual
         Some(windowValues(1L, 1L, 2L))
 
@@ -396,13 +395,14 @@ class MegaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
         expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
         expectedValues = windowValues(1L, 1L, 1L))
 
-      // After one idle hop, SparseKeyLag uses PT eviction and rolls currentDayStart to Jul23.
-      driver.setProcessingTime("2025-07-23T10:40:00Z")
-      assertSingleOutput(
-        driver.drainNewOutputs(),
-        expectedKey = "gen_sparse_replay_drop",
-        expectedDayStart = dayStart("2025-07-23T00:00:00Z"),
-        expectedValues = windowValues(null, null, null))
+      // After one idle hop, SparseKeyLag uses PT eviction and rolls currentDayStart to Jul23. The
+      // rebuild can be in-memory-only when the packed value is unchanged.
+      driver.setProcessingTime("2025-07-23T10:40:00.001Z")
+      driver.drainNewOutputs().lastOption.foreach { output =>
+        output.keys shouldEqual List("gen_sparse_replay_drop")
+        output.dayStartMillis shouldEqual dayStart("2025-07-23T00:00:00Z")
+        output.values shouldEqual windowValues(null, null, null)
+      }
 
       // A later Jul21 backlog event would be valid under active replay, but after the PT roll it is
       // older than currentDayStart - 1d and must be dropped permanently.
@@ -579,6 +579,206 @@ class MegaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       outputs.head.processingTsMillis shouldEqual expectedEmitTs
     }
   }
+
+  it should "wall-clock cadence emissions use stable per-key phase and emit only when dirty" in {
+    val key = "gen_cadence"
+    val baseProcessingTs = toMillis("2025-07-21T10:30:00Z")
+    val cadenceMillis = 60 * 1000L
+    val firstTick = nextCadenceEmitTick(key, baseProcessingTs, cadenceMillis)
+    val secondTick = firstTick + cadenceMillis
+
+    withDriver(bufferingOutputTimeMillis = cadenceMillis,
+               emissionPolicy = MegaTileEmissionPolicy.WallClockCadence) { driver =>
+      driver.processWatermark("2025-07-21T10:25:30Z")
+      driver.setProcessingTimeMillis(baseProcessingTs)
+      driver.processEvent(key, "2025-07-21T10:30:00Z", "user_1")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(firstTick - 1L)
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(firstTick)
+      val firstOutputs = driver.drainNewOutputs()
+      assertSingleOutput(
+        firstOutputs,
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
+        expectedValues = windowValues(1L, 1L, 1L))
+      firstOutputs.head.processingTsMillis shouldEqual firstTick
+
+      driver.setProcessingTimeMillis(secondTick)
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.processWatermark("2025-07-21T10:32:00Z")
+      driver.setProcessingTimeMillis(secondTick + 1L)
+      driver.processEvent(key, "2025-07-21T10:31:00Z", "user_2")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(secondTick + cadenceMillis)
+      val secondOutputs = driver.drainNewOutputs()
+      assertSingleOutput(
+        secondOutputs,
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
+        expectedValues = windowValues(2L, 2L, 2L))
+      secondOutputs.head.processingTsMillis shouldEqual secondTick + cadenceMillis
+    }
+  }
+
+  it should "wall-clock cadence uses dirty-buffered fallback before first watermark" in {
+    val cadenceMillis = 60 * 1000L
+    val beforeMidnightTs = toMillis("2025-07-21T23:59:30Z")
+    val midnight = toMillis("2025-07-22T00:00:00Z")
+    val dirtyBufferedTick = beforeMidnightTs + cadenceMillis
+    val key = keyWithNextCadenceTickBetween(
+      prefix = "gen_cadence_no_watermark",
+      processingTs = beforeMidnightTs,
+      cadenceMillis = cadenceMillis,
+      lowerBound = midnight,
+      upperBound = dirtyBufferedTick,
+      cadenceGroupBy = largeOnlyGroupBy)
+    val cadenceTick = nextCadenceEmitTick(key, beforeMidnightTs, cadenceMillis, largeOnlyGroupBy)
+
+    withDriver(bufferingOutputTimeMillis = cadenceMillis,
+               emissionPolicy = MegaTileEmissionPolicy.WallClockCadence,
+               testGroupBy = largeOnlyGroupBy) { driver =>
+      driver.setProcessingTimeMillis(beforeMidnightTs)
+      driver.processEvent(key, "2025-07-21T23:59:30Z", "user_before_watermark")
+      driver.drainNewOutputs() shouldBe empty
+
+      cadenceTick should be > midnight
+      cadenceTick should be < dirtyBufferedTick
+      driver.setProcessingTimeMillis(cadenceTick)
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(dirtyBufferedTick)
+      val outputs = driver.drainNewOutputs()
+      assertSingleOutput(
+        outputs,
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
+        expectedValues = Seq(1L))
+      outputs.head.processingTsMillis shouldEqual dirtyBufferedTick
+    }
+  }
+
+  it should "wall-clock cadence allows one bounded off-phase emit after catchup becomes live" in {
+    val cadenceMillis = 60 * 1000L
+    val catchupProcessingTs = toMillis("2025-07-21T10:30:00Z")
+    val liveTransitionTs = toMillis("2025-07-21T10:30:30Z")
+    val dirtyBufferedTick = catchupProcessingTs + cadenceMillis
+    val key = keyWithNextCadenceTickAfter(
+      prefix = "gen_cadence_catchup_live",
+      processingTs = liveTransitionTs,
+      cadenceMillis = cadenceMillis,
+      lowerBound = dirtyBufferedTick + 1L)
+    val cadenceTick = nextCadenceEmitTick(key, liveTransitionTs, cadenceMillis)
+
+    withDriver(bufferingOutputTimeMillis = cadenceMillis,
+               emissionPolicy = MegaTileEmissionPolicy.WallClockCadence) { driver =>
+      driver.processWatermark("2025-07-21T10:24:00Z")
+      driver.setProcessingTimeMillis(catchupProcessingTs)
+      driver.processEvent(key, "2025-07-21T10:30:00Z", "user_1")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.processWatermark("2025-07-21T10:25:30Z")
+      driver.setProcessingTimeMillis(liveTransitionTs)
+      driver.processEvent(key, "2025-07-21T10:30:30Z", "user_2")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(dirtyBufferedTick)
+      val offPhaseOutputs = driver.drainNewOutputs()
+      offPhaseOutputs should have size 1
+      offPhaseOutputs.head.keys shouldEqual List(key)
+      offPhaseOutputs.head.processingTsMillis shouldEqual dirtyBufferedTick
+
+      driver.setProcessingTimeMillis(dirtyBufferedTick + 1L)
+      driver.processEvent(key, "2025-07-21T10:31:00Z", "user_3")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(cadenceTick)
+      val cadenceOutputs = driver.drainNewOutputs()
+      cadenceOutputs should have size 1
+      cadenceOutputs.head.keys shouldEqual List(key)
+      cadenceOutputs.head.processingTsMillis shouldEqual cadenceTick
+    }
+  }
+
+  it should "wall-clock cadence emit timer rolls large-window-only keys across UTC day" in {
+    val cadenceMillis = 60 * 1000L
+    val midnight = toMillis("2025-07-22T00:00:00Z")
+    val beforeMidnightTs = toMillis("2025-07-21T23:59:30Z")
+    val key = keyWithNextCadenceTickAfter(
+      prefix = "gen_cadence_large_day_roll",
+      processingTs = beforeMidnightTs,
+      cadenceMillis = cadenceMillis,
+      lowerBound = midnight,
+      cadenceGroupBy = largeOnlyGroupBy)
+    val firstTick = nextCadenceEmitTick(key, beforeMidnightTs, cadenceMillis, largeOnlyGroupBy)
+    val secondTick = firstTick + cadenceMillis
+
+    withDriver(bufferingOutputTimeMillis = cadenceMillis,
+               emissionPolicy = MegaTileEmissionPolicy.WallClockCadence,
+               testGroupBy = largeOnlyGroupBy) { driver =>
+      driver.processWatermark("2025-07-21T23:59:30Z")
+      driver.setProcessingTimeMillis(beforeMidnightTs)
+      driver.processEvent(key, "2025-07-21T23:59:30Z", "user_before_midnight")
+      driver.drainNewOutputs() shouldBe empty
+
+      firstTick should be > midnight
+      driver.setProcessingTimeMillis(firstTick - 1L)
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(firstTick)
+      val dayRollOutputs = driver.drainNewOutputs()
+      assertSingleOutput(
+        dayRollOutputs,
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
+        expectedValues = Seq(1L))
+      dayRollOutputs.head.processingTsMillis shouldEqual firstTick
+
+      driver.setProcessingTimeMillis(firstTick + 1L)
+      driver.processEvent(key, "2025-07-22T00:00:30Z", "user_after_midnight")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.setProcessingTimeMillis(secondTick)
+      val afterMidnightOutputs = driver.drainNewOutputs()
+      assertSingleOutput(
+        afterMidnightOutputs,
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-22T00:00:00Z"),
+        expectedValues = Seq(1L))
+      afterMidnightOutputs.head.processingTsMillis shouldEqual secondTick
+    }
+  }
+
+  it should "wall-clock cadence preserves pending day-roll output when watermark outruns PT emit" in {
+    val cadenceMillis = 5 * 60 * 1000L
+    val processingTs = toMillis("2025-07-23T10:00:00Z")
+    val key = "gen_cadence_pending_day_roll"
+
+    withDriver(bufferingOutputTimeMillis = cadenceMillis,
+               emissionPolicy = MegaTileEmissionPolicy.WallClockCadence,
+               testGroupBy = largeOnlyGroupBy) { driver =>
+      driver.processWatermark("2025-07-21T23:50:00Z")
+      driver.setProcessingTimeMillis(processingTs)
+      driver.processEvent(key, "2025-07-21T23:50:00Z", "user_day_1")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.processWatermark("2025-07-22T00:00:01Z")
+      driver.processEvent(key, "2025-07-22T00:00:00Z", "user_day_2")
+      driver.drainNewOutputs() shouldBe empty
+
+      driver.processWatermark("2025-07-23T00:00:01Z")
+      driver.processEvent(key, "2025-07-23T00:00:00Z", "user_day_3")
+      assertSingleOutput(
+        driver.drainNewOutputs(),
+        expectedKey = key,
+        expectedDayStart = dayStart("2025-07-21T00:00:00Z"),
+        expectedValues = Seq(1L))
+    }
+  }
 }
 
 object MegaTileProcessFunctionTest extends Matchers {
@@ -609,6 +809,34 @@ object MegaTileProcessFunctionTest extends Matchers {
         )
       ),
       metaData = Builders.MetaData(name = "mega_tile_process_function_test"),
+      accuracy = Accuracy.TEMPORAL
+    )
+    gb.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
+    gb
+  }
+
+  private val largeOnlyGroupBy: GroupBy = {
+    val gb = Builders.GroupBy(
+      sources = Seq(
+        Builders.Source.events(
+          table = "events.test_stream",
+          topic = "events.test_stream",
+          query = Builders.Query(
+            selects = Map("id" -> "id", "view_by" -> "view_by"),
+            timeColumn = Constants.TimeColumn,
+            startPartition = "20250101"
+          )
+        )
+      ),
+      keyColumns = Seq("id"),
+      aggregations = Seq(
+        Builders.Aggregation(
+          operation = Operation.COUNT,
+          inputColumn = "view_by",
+          windows = Seq(new Window(3, TimeUnit.DAYS))
+        )
+      ),
+      metaData = Builders.MetaData(name = "mega_tile_process_function_large_only_test"),
       accuracy = Accuracy.TEMPORAL
     )
     gb.setOnlineStrategy(OnlineStrategy.STREAMING_MEGATILES)
@@ -722,8 +950,15 @@ object MegaTileProcessFunctionTest extends Matchers {
       processingTsMillis: Long,
       values: Seq[Any])
 
-  final private class Driver(bufferingOutputTimeMillis: Long, bufferingOutputJitterMillis: Long) {
-    private val testHarness = harness(bufferingOutputTimeMillis, bufferingOutputJitterMillis)
+  final private class Driver(bufferingOutputTimeMillis: Long,
+                             bufferingOutputJitterMillis: Long,
+                             emissionPolicy: MegaTileEmissionPolicy,
+                             testGroupBy: GroupBy) {
+    private val outputCodec = new MegaTileCodec(testGroupBy, inputSchema)
+    private val testHarness = harness(bufferingOutputTimeMillis,
+                                      bufferingOutputJitterMillis,
+                                      emissionPolicy,
+                                      testGroupBy)
     private var emittedCount = 0
     private var currentProcessingTs = 0L
 
@@ -749,7 +984,7 @@ object MegaTileProcessFunctionTest extends Matchers {
         0L)
 
     def drainNewOutputs(): List[DecodedOutput] = {
-      val allOutputs = testHarness.extractOutputValues().asScala.toList.map(decodeOutput)
+      val allOutputs = testHarness.extractOutputValues().asScala.toList.map(decodeOutput(_, outputCodec))
       val newOutputs = allOutputs.drop(emittedCount)
       emittedCount = allOutputs.size
       newOutputs
@@ -759,9 +994,12 @@ object MegaTileProcessFunctionTest extends Matchers {
       testHarness.close()
   }
 
-  private def withDriver(bufferingOutputTimeMillis: Long, bufferingOutputJitterMillis: Long = 0L)(
+  private def withDriver(bufferingOutputTimeMillis: Long,
+                         bufferingOutputJitterMillis: Long = 0L,
+                         emissionPolicy: MegaTileEmissionPolicy = MegaTileEmissionPolicy.Default,
+                         testGroupBy: GroupBy = groupBy)(
       fn: Driver => Unit): Unit = {
-    val driver = new Driver(bufferingOutputTimeMillis, bufferingOutputJitterMillis)
+    val driver = new Driver(bufferingOutputTimeMillis, bufferingOutputJitterMillis, emissionPolicy, testGroupBy)
     try {
       fn(driver)
     } finally {
@@ -770,15 +1008,18 @@ object MegaTileProcessFunctionTest extends Matchers {
   }
 
   private def harness(bufferingOutputTimeMillis: Long,
-                      bufferingOutputJitterMillis: Long = 0L)
+                      bufferingOutputJitterMillis: Long = 0L,
+                      emissionPolicy: MegaTileEmissionPolicy = MegaTileEmissionPolicy.Default,
+                      testGroupBy: GroupBy = groupBy)
       : KeyedOneInputStreamOperatorTestHarness[java.util.List[Any], ProjectedEvent, TimestampedTile] = {
     new KeyedOneInputStreamOperatorTestHarness[java.util.List[Any], ProjectedEvent, TimestampedTile](
       new KeyedProcessOperator[java.util.List[Any], ProjectedEvent, TimestampedTile](
         new MegaTileProcessFunction(
-          groupBy,
+          testGroupBy,
           inputSchema,
           bufferingOutputTimeMillis = bufferingOutputTimeMillis,
-          bufferingOutputJitterMillis = bufferingOutputJitterMillis
+          bufferingOutputJitterMillis = bufferingOutputJitterMillis,
+          emissionPolicy = emissionPolicy
         )),
       new KeySelector[ProjectedEvent, java.util.List[Any]] {
         override def getKey(value: ProjectedEvent): java.util.List[Any] =
@@ -812,12 +1053,15 @@ object MegaTileProcessFunctionTest extends Matchers {
   }
 
   private def decodeOutput(tile: TimestampedTile): DecodedOutput =
+    decodeOutput(tile, megaTileCodec)
+
+  private def decodeOutput(tile: TimestampedTile, codec: MegaTileCodec): DecodedOutput =
     DecodedOutput(
       keys = tile.keys.asScala.toList,
       dayStartMillis = tile.latestTsMillis,
       processingTsMillis = tile.startProcessingTime,
-      values = megaTileCodec.rowAggregator
-        .finalize(megaTileCodec.decode(tile.tileBytes))
+      values = codec.rowAggregator
+        .finalize(codec.decode(tile.tileBytes))
         .toSeq
     )
 
@@ -826,4 +1070,43 @@ object MegaTileProcessFunctionTest extends Matchers {
 
   private def toMillis(iso: String): Long =
     Instant.parse(iso).toEpochMilli
+
+  private def nextCadenceEmitTick(key: String,
+                                  processingTs: Long,
+                                  cadenceMillis: Long,
+                                  cadenceGroupBy: GroupBy = groupBy): Long = {
+    val phase = Math.floorMod(
+      (cadenceGroupBy.getMetaData.getName :: List(key)).hashCode().toLong,
+      cadenceMillis)
+    val elapsedSincePhase = Math.floorMod(processingTs - phase, cadenceMillis)
+    val delay = if (elapsedSincePhase == 0L) cadenceMillis else cadenceMillis - elapsedSincePhase
+    processingTs + delay
+  }
+
+  private def keyWithNextCadenceTickAfter(prefix: String,
+                                          processingTs: Long,
+                                          cadenceMillis: Long,
+                                          lowerBound: Long,
+                                          cadenceGroupBy: GroupBy = groupBy): String =
+    Iterator
+      .from(0)
+      .map(index => s"${prefix}_$index")
+      .find(key => nextCadenceEmitTick(key, processingTs, cadenceMillis, cadenceGroupBy) > lowerBound)
+      .getOrElse(throw new IllegalStateException(s"No cadence key found for prefix=$prefix"))
+
+  private def keyWithNextCadenceTickBetween(prefix: String,
+                                            processingTs: Long,
+                                            cadenceMillis: Long,
+                                            lowerBound: Long,
+                                            upperBound: Long,
+                                            cadenceGroupBy: GroupBy = groupBy): String =
+    Iterator
+      .from(0)
+      .map(index => s"${prefix}_$index")
+      .find { key =>
+        val tick = nextCadenceEmitTick(key, processingTs, cadenceMillis, cadenceGroupBy)
+        tick > lowerBound && tick < upperBound
+      }
+      .getOrElse(throw new IllegalStateException(
+        s"No cadence key found for prefix=$prefix between $lowerBound and $upperBound"))
 }

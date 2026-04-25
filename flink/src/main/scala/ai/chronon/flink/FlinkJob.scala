@@ -17,6 +17,7 @@ import ai.chronon.flink.window.{
   FlinkRowAggProcessFunction,
   FlinkRowAggregationFunction,
   KeySelectorBuilder,
+  MegaTileEmissionPolicy,
   MegaTileProcessFunction
 }
 import ai.chronon.online.fetcher.{FetchContext, MetadataStore}
@@ -137,7 +138,8 @@ abstract class BaseFlinkJob {
       kvStoreCapacity: Int,
       enableDebug: Boolean,
       bufferingOutputTimeMillis: Long,
-      bufferingOutputJitterMillis: Long
+      bufferingOutputJitterMillis: Long,
+      emissionPolicy: MegaTileEmissionPolicy
   ): DataStream[WriteResponse] = {
     val megaTileDS = preparedStream
       .keyBy(KeySelectorBuilder.build(groupByServingInfoParsed.groupBy))
@@ -146,7 +148,8 @@ abstract class BaseFlinkJob {
                                     schema,
                                     enableDebug,
                                     bufferingOutputTimeMillis,
-                                    bufferingOutputJitterMillis))
+                                    bufferingOutputJitterMillis,
+                                    emissionPolicy))
       .uid(s"mega-tiling-$groupByName")
       .name(s"Mega Tiling for $groupByName")
       .setParallelism(parallelism)
